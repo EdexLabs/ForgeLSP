@@ -1,95 +1,100 @@
-name: Release
+name: Build & Release
 
 on:
   push:
-    branches: "main"
-  workflow_dispatch:
+    branches:
+      - "main"
 
 jobs:
   build:
-    name: Build - ${{ matrix.platform.name }}
     strategy:
+      fail-fast: false
       matrix:
-        platform:
-          - name: linux-x86_64
-            os: ubuntu-latest
+        include:
+          - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            bin: ForgeLSP
-          - name: linux-aarch64
-            os: ubuntu-latest
+            arch: x86_64
+            platform: linux
+            ext: ""
+          - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
-            bin: ForgeLSP
-            use-cross: true
-          - name: macos-x86_64
-            os: macos-latest
+            arch: aarch64
+            platform: linux
+            ext: ""
+          - os: macos-latest
             target: x86_64-apple-darwin
-            bin: ForgeLSP
-          - name: macos-aarch64
-            os: macos-latest
+            arch: x86_64
+            platform: macos
+            ext: ""
+          - os: macos-latest
             target: aarch64-apple-darwin
-            bin: ForgeLSP
-          - name: windows-x86_64
-            os: windows-latest
+            arch: aarch64
+            platform: macos
+            ext: ""
+          - os: windows-latest
             target: x86_64-pc-windows-msvc
-            bin: ForgeLSP.exe
+            arch: x86_64
+            platform: windows
+            ext: ".exe"
 
-    runs-on: ${{ matrix.platform.os }}
+    runs-on: ${{ matrix.os }}
 
     steps:
-      - name: Checkout
+      - name: Checkout Repository
         uses: actions/checkout@v4
-        with:
-          submodules: recursive
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.platform.target }}
+          targets: ${{ matrix.target }}
 
-      - name: Install cross
-        if: matrix.platform.use-cross
-        run: cargo install cross --git https://github.com/cross-rs/cross
-
-      - name: Build
+      - name: Install Dependencies (Linux ARM64 only)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
-          if [ "${{ matrix.platform.use-cross }}" == "true" ]; then
-            cross build --release --target ${{ matrix.platform.target }}
-          else
-            cargo build --release --target ${{ matrix.platform.target }}
-          fi
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu binutils-aarch64-linux-gnu libc6-dev-arm64-cross lld
+          rustup target add aarch64-unknown-linux-gnu
+
+      - name: Build Binary
         shell: bash
+        run: |
+          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
+            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+          fi
+          cargo build --release --target ${{ matrix.target }}
 
       - name: Prepare Artifact
-        run: |
-          mkdir -p release
-          cp target/${{ matrix.platform.target }}/release/${{ matrix.platform.bin }} release/
-          cd release
-          if [ "${{ runner.os }}" == "Windows" ]; then
-            7z a ../ForgeLSP-${{ matrix.platform.name }}.zip ${{ matrix.platform.bin }}
-          else
-            tar -czf ../ForgeLSP-${{ matrix.platform.name }}.tar.gz ${{ matrix.platform.bin }}
-          fi
         shell: bash
+        run: |
+          mkdir -p output
+          binary_name=$(cargo metadata --format-version 1 --no-deps | jq -r '.packages[0].name')
+          cp target/${{ matrix.target }}/release/${binary_name}${{ matrix.ext }} \
+            output/${binary_name}-${{ matrix.platform }}-${{ matrix.arch }}${{ matrix.ext }}
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: forge-lsp-${{ matrix.platform.name }}
-          path: ForgeLSP-${{ matrix.platform.name }}.*
+          name: ${{ matrix.platform }}-${{ matrix.arch }}
+          path: output/*
 
   release:
-    name: Create Release
-    needs: build
+    name: Create or Update GitHub Release
+    needs: [build]
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/')
-    steps:
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
 
-      - name: Create Release
+    steps:
+      - name: Download Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Create or Update Release
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            forge-lsp-*/*
+          tag_name: ${{ github.ref_name }}
+          name: Release (${{ github.ref_name }})
+          files: dist/**/*
+          draft: false
+          prerelease: true
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.TOKEN }}
