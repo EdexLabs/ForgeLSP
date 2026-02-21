@@ -1,7 +1,7 @@
 use forge_kit::metadata::MetadataManager;
 use forge_kit::metadata::MetadataSource;
 use forge_kit::parser::{self, AstNode, ParseError, Span, ValidationConfig};
-use forge_kit::types::{Arg, Function};
+use forge_kit::types::Function;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -252,7 +252,11 @@ impl LanguageServer for ForgeLanguageServer {
                 )),
                 // Completion: trigger on '$' so the user immediately gets suggestions
                 completion_provider: Some(lsp_types::CompletionOptions {
-                    trigger_characters: Some(vec!["$".to_string()]),
+                    trigger_characters: Some(vec![
+                        "$".to_string(),
+                        "[".to_string(),
+                        ";".to_string(),
+                    ]),
                     resolve_provider: Some(false),
                     ..lsp_types::CompletionOptions::default()
                 }),
@@ -264,6 +268,19 @@ impl LanguageServer for ForgeLanguageServer {
                     retrigger_characters: Some(vec![";".to_string()]),
                     ..lsp_types::SignatureHelpOptions::default()
                 }),
+                semantic_tokens_provider: Some(
+                    lsp_types::SemanticTokensServerCapabilities::SemanticTokensOptions(
+                        lsp_types::SemanticTokensOptions {
+                            legend: lsp_types::SemanticTokensLegend {
+                                token_types: vec![lsp_types::SemanticTokenType::FUNCTION],
+                                token_modifiers: vec![],
+                            },
+                            full: Some(lsp_types::SemanticTokensFullOptions::Bool(true)),
+                            range: Some(false),
+                            ..lsp_types::SemanticTokensOptions::default()
+                        },
+                    ),
+                ),
                 ..lsp_types::ServerCapabilities::default()
             },
             ..lsp_types::InitializeResult::default()
@@ -466,21 +483,21 @@ impl LanguageServer for ForgeLanguageServer {
 
         let cursor_offset = position_to_byte_offset(&text, pos);
 
-        // Use cached AST to find the function call under the cursor
-        let func_name = {
+        // Use cached AST to find info
+        let h_info = {
             let cache = self.parse_cache.read().await;
             match cache.get(uri) {
-                Some(cached) => find_function_at(&cached.ast, cursor_offset),
+                Some(cached) => find_hover_info(&cached.ast, cursor_offset, 0),
                 None => None,
             }
         };
 
-        let func_name = match func_name {
-            Some(n) => n,
+        let (func_name, active_arg, depth) = match h_info {
+            Some(i) => (i.func_name, i.active_arg_index, i.depth),
             None => {
-                // Fallback: scan text directly for hovered function name
+                // Fallback: scan text for function name
                 match find_function_name_at_offset(&text, cursor_offset) {
-                    Some(n) => n,
+                    Some(name) => (name, None, 0),
                     None => return Ok(None),
                 }
             }
@@ -491,7 +508,7 @@ impl LanguageServer for ForgeLanguageServer {
             None => return Ok(None),
         };
 
-        let hover_md = build_hover_markdown(&func);
+        let hover_md = build_hover_markdown(&func, active_arg, depth);
 
         Ok(Some(lsp_types::Hover {
             contents: lsp_types::HoverContents::Markup(lsp_types::MarkupContent {
@@ -546,7 +563,7 @@ impl LanguageServer for ForgeLanguageServer {
             None => return Ok(None),
         };
 
-        let sig = build_signature_info(&func, &self.metadata);
+        let sig = build_signature_info(&func);
         let active_param = call_info.arg_index as u32;
 
         Ok(Some(lsp_types::SignatureHelp {
@@ -554,6 +571,71 @@ impl LanguageServer for ForgeLanguageServer {
             active_signature: Some(0),
             active_parameter: Some(active_param),
         }))
+    }
+
+    async fn semantic_tokens_full(
+        &self,
+        params: lsp_types::SemanticTokensParams,
+    ) -> Result<Option<lsp_types::SemanticTokensResult>> {
+        let uri = &params.text_document.uri;
+
+        let text = {
+            let docs = self.documents.read().await;
+            match docs.get(uri) {
+                Some(t) => t.clone(),
+                None => return Ok(None),
+            }
+        };
+
+        let cache = self.parse_cache.read().await;
+        let ast = match cache.get(uri) {
+            Some(cached) => &cached.ast,
+            None => return Ok(None),
+        };
+
+        let mut tokens = Vec::new();
+        collect_semantic_tokens(ast, &text, &mut tokens);
+
+        // Sort tokens by line, then start character
+        tokens.sort_by(|a, b| {
+            if a.line != b.line {
+                a.line.cmp(&b.line)
+            } else {
+                a.start.cmp(&b.start)
+            }
+        });
+
+        // Delta encoding
+        let mut data = Vec::new();
+        let mut last_line = 0u32;
+        let mut last_char = 0u32;
+
+        for token in tokens {
+            let line_delta = token.line - last_line;
+            let char_delta = if line_delta == 0 {
+                token.start - last_char
+            } else {
+                token.start
+            };
+
+            data.push(lsp_types::SemanticToken {
+                delta_line: line_delta,
+                delta_start: char_delta,
+                length: token.length,
+                token_type: token.token_type,
+                token_modifiers_bitset: token.modifier_mask,
+            });
+
+            last_line = token.line;
+            last_char = token.start;
+        }
+
+        Ok(Some(lsp_types::SemanticTokensResult::Tokens(
+            lsp_types::SemanticTokens {
+                result_id: None,
+                data,
+            },
+        )))
     }
 }
 
@@ -642,8 +724,7 @@ fn extract_dollar_prefix(text: &str, cursor: usize) -> String {
     let bytes = text.as_bytes();
     let cursor = cursor.min(bytes.len());
 
-    // Walk back over alphanumeric / underscore to find identifier chars
-    let end = cursor;
+    // Walk back to find the identifier part
     let mut start = cursor;
     while start > 0 {
         let b = bytes[start - 1];
@@ -653,13 +734,28 @@ fn extract_dollar_prefix(text: &str, cursor: usize) -> String {
             break;
         }
     }
+    let id_start = start;
 
-    // There must be a `$` right before the identifier start
-    if start > 0 && bytes[start - 1] == b'$' {
-        text[start..end].to_string()
-    } else {
-        String::new()
+    // Now look back for the first '$' in a continuous sequence of '$' and modifiers.
+    // However, for prefix searching, we just want the identifier part.
+    // The server completion logic uses search_prefix = format!("${}", prefix).
+
+    // Check if there is a '$' somewhere before.
+    let mut search = id_start;
+    while search > 0 {
+        let b = bytes[search - 1];
+        if b == b'$' {
+            // Found a '$', this is our start.
+            return text[id_start..cursor].to_string();
+        } else if b.is_ascii_alphabetic() || b == b'@' || b == b'!' || b == b'#' || b == b'?' {
+            // Likely a modifier, keep looking back
+            search -= 1;
+        } else {
+            break;
+        }
     }
+
+    String::new()
 }
 
 /// Context when the cursor is inside a function's argument list.
@@ -831,9 +927,27 @@ fn build_completion_item(func: &Function, text: &str, cursor: usize) -> lsp_type
         }
     }
 
-    // The '$' is right before the identifier
-    let range = if start > 0 && bytes[start - 1] == b'$' {
-        let start_pos = byte_offset_to_position(text, start - 1);
+    let id_start = start;
+
+    // Now walk back further to find the first '$'
+    let mut first_dollar = id_start;
+    let mut found_any_dollar = false;
+    let mut search = id_start;
+    while search > 0 {
+        let b = bytes[search - 1];
+        if b == b'$' {
+            first_dollar = search - 1;
+            found_any_dollar = true;
+            search -= 1;
+        } else if b == b'!' || b == b'@' || b == b'#' || b == b'?' || b == b'&' {
+            search -= 1;
+        } else {
+            break;
+        }
+    }
+
+    let range = if found_any_dollar {
+        let start_pos = byte_offset_to_position(text, first_dollar);
         let end_pos = byte_offset_to_position(text, cursor);
         Some(lsp_types::Range {
             start: start_pos,
@@ -869,10 +983,14 @@ fn build_completion_item(func: &Function, text: &str, cursor: usize) -> lsp_type
         },
         insert_text: Some(insert_text),
         text_edit: range.map(|r| {
-            lsp_types::CompletionTextEdit::Edit(lsp_types::TextEdit {
-                range: r,
-                new_text: func.name.clone(),
-            })
+            let modifiers = if found_any_dollar {
+                &text[first_dollar..id_start]
+            } else {
+                "$"
+            };
+            let new_text = format!("{}{}", modifiers, func.name);
+
+            lsp_types::CompletionTextEdit::Edit(lsp_types::TextEdit { range: r, new_text })
         }),
         insert_text_format: Some(lsp_types::InsertTextFormat::PLAIN_TEXT),
         ..lsp_types::CompletionItem::default()
@@ -887,14 +1005,20 @@ fn first_sentence(s: &str) -> String {
 // AST traversal helpers
 // ============================================================================
 
-/// Walk the AST and find the name of the innermost `FunctionCall` node
-/// whose `span` contains `offset`. Returns `"$name"` form.
-fn find_function_at(node: &AstNode, offset: usize) -> Option<String> {
+/// Context for hover: the function name, active argument index, and depth.
+struct HoverInfo {
+    func_name: String,
+    active_arg_index: Option<usize>,
+    depth: usize,
+}
+
+/// Walk AST to find the innermost `FunctionCall` containing `offset`.
+fn find_hover_info(node: &AstNode, offset: usize, current_depth: usize) -> Option<HoverInfo> {
     match node {
         AstNode::Program { body, .. } => {
             for child in body {
-                if let Some(name) = find_function_at(child, offset) {
-                    return Some(name);
+                if let Some(info) = find_hover_info(child, offset, current_depth) {
+                    return Some(info);
                 }
             }
             None
@@ -903,33 +1027,42 @@ fn find_function_at(node: &AstNode, offset: usize) -> Option<String> {
             name,
             span,
             args,
-            name_span: _,
+            name_span,
             ..
         } => {
-            // Hover works on the name_span region for best UX
-            let in_span = offset >= span.start && offset < span.end;
-            if !in_span {
+            if offset < span.start || offset >= span.end {
                 return None;
             }
 
-            // Check nested args first for inner functions
+            // Check nested args first (depth increases)
             if let Some(args) = args {
                 for arg in args {
                     for part in &arg.parts {
-                        if let Some(inner) = find_function_at(part, offset) {
+                        if let Some(inner) = find_hover_info(part, offset, current_depth + 1) {
                             return Some(inner);
                         }
                     }
                 }
             }
 
-            // Return this node's name
+            // ONLY trigger hover if we are over the name itself
+            let in_name = offset >= name_span.start && offset < name_span.end;
+            if !in_name {
+                return None;
+            }
+
+            let active_arg_index = None;
             let full_name = if name.starts_with('$') {
                 name.clone()
             } else {
                 format!("${}", name)
             };
-            Some(full_name)
+
+            Some(HoverInfo {
+                func_name: full_name,
+                active_arg_index,
+                depth: current_depth,
+            })
         }
         _ => None,
     }
@@ -1044,7 +1177,7 @@ fn find_call_from_text(text: &str, cursor: usize) -> Option<CallInfo> {
 // ============================================================================
 
 /// Build rich hover markdown for a function.
-pub fn build_hover_markdown(func: &Function) -> String {
+pub fn build_hover_markdown(func: &Function, _active_arg: Option<usize>, depth: usize) -> String {
     let mut md = String::new();
 
     // ── Header (Usage) ──────────────────────────────────────────────────────
@@ -1060,7 +1193,7 @@ pub fn build_hover_markdown(func: &Function) -> String {
         md.push('\n');
     }
 
-    // ── Category / Extension ────────────────────────────────────────────────
+    // ── Category / Extension / Metadata ─────────────────────────────────────
     md.push('\n');
     let mut badges: Vec<String> = Vec::new();
     if let Some(ext) = &func.extension {
@@ -1069,6 +1202,11 @@ pub fn build_hover_markdown(func: &Function) -> String {
     if let Some(cat) = &func.category {
         badges.push(format!("Category: *{}*", cat));
     }
+    badges.push(format!("Depth: *{}*", depth));
+    if let Some(args) = &func.args {
+        badges.push(format!("Arguments: *{}*", args.len()));
+    }
+
     if !badges.is_empty() {
         md.push_str(&badges.join(" · "));
         md.push('\n');
@@ -1083,18 +1221,22 @@ pub fn build_hover_markdown(func: &Function) -> String {
     }
 
     // ── Links ───────────────────────────────────────────────────────────────
-    md.push('\n');
+    let mut links = Vec::new();
     if let Some(url) = &func.source_url {
         if let Some(github) = extract_github_url(url) {
-            md.push_str(&format!("[Github]({})\n\n", github));
+            links.push(format!("[Github]({})", github));
         }
     }
-
     if let Some(ext) = &func.extension {
-        md.push_str(&format!(
-            "[Documentation](https://docs.botforge.org/function/?p={})\n",
+        links.push(format!(
+            "[Documentation](https://docs.botforge.org/function/?p={})",
             ext
         ));
+    }
+    if !links.is_empty() {
+        md.push_str("\n---\n");
+        md.push_str(&links.join(" | "));
+        md.push('\n');
     }
 
     // ── Aliases ─────────────────────────────────────────────────────────────
@@ -1137,84 +1279,20 @@ fn extract_github_url(source_url: &str) -> Option<String> {
 
 /// Build the same hover markdown for use in completion documentation.
 /// Slightly more compact (no `---` separator).
-fn build_hover_markdown_for_completion(func: &Function) -> String {
-    let mut md = String::new();
-
-    if !func.description.is_empty() {
-        md.push_str(&func.description);
-        md.push('\n');
-    }
-
-    if let Some(args) = &func.args {
-        if !args.is_empty() {
-            md.push('\n');
-            md.push_str("**Arguments**\n\n");
-            md.push_str("| Name | Type | Required |\n");
-            md.push_str("|------|------|:--------:|\n");
-            for arg in args {
-                let name = if arg.rest {
-                    format!("{}...", arg.name)
-                } else {
-                    arg.name.clone()
-                };
-                let ty = format_arg_type(&arg.arg_type);
-                let req = if arg.required.unwrap_or(false) {
-                    "✓"
-                } else {
-                    ""
-                };
-                md.push_str(&format!("| `{}` | {} | {} |\n", name, ty, req));
-            }
-        }
-    }
-
-    if let Some(output) = &func.output {
-        if !output.is_empty() {
-            md.push('\n');
-            md.push_str(&format!("**Returns:** `{}`\n", output.join("` | `")));
-        }
-    }
-
-    md
-}
-
-/// Build enum value hint string for an argument (e.g. "one of: `a`, `b`").
-fn build_enum_hint(arg: &Arg, metadata: &MetadataManager) -> String {
-    let values = if let Some(inline) = &arg.arg_enum {
-        if !inline.is_empty() {
-            Some(inline.clone())
-        } else {
-            None
-        }
-    } else if let Some(enum_name) = &arg.enum_name {
-        metadata.get_enum(enum_name)
-    } else {
-        None
-    };
-
-    if let Some(vals) = values {
-        if vals.is_empty() {
-            return String::new();
-        }
-        // Show at most 8 values inline, then indicate there are more
-        if vals.len() <= 8 {
-            let quoted: Vec<String> = vals.iter().map(|v| format!("`{}`", v)).collect();
-            format!("one of: {}", quoted.join(", "))
-        } else {
-            let first8: Vec<String> = vals.iter().take(8).map(|v| format!("`{}`", v)).collect();
-            format!("one of: {}, … ({} total)", first8.join(", "), vals.len())
-        }
-    } else {
-        String::new()
-    }
+pub fn build_hover_markdown_for_completion(func: &Function) -> String {
+    build_hover_markdown(func, None, 0)
 }
 
 /// Build the refined usage line.
 /// Format: $function[Arg: Type; Arg: Type; ?OptionalArg: Type; ...RestArg: Type]
 fn build_usage_line_v2(func: &Function) -> String {
-    let has_brackets = func.brackets.unwrap_or(false);
+    let has_args = match &func.args {
+        Some(v) => !v.is_empty(),
+        None => false,
+    };
+    let show_brackets = func.brackets.unwrap_or(false) || has_args;
 
-    if !has_brackets {
+    if !show_brackets {
         return func.name.clone();
     }
 
@@ -1223,21 +1301,22 @@ fn build_usage_line_v2(func: &Function) -> String {
             let arg_parts: Vec<String> = vec
                 .iter()
                 .map(|a| {
-                    let mut prefix = String::new();
+                    let mut name_part = a.name.clone();
                     if a.rest {
-                        prefix.push_str("...");
-                    } else if !a.required.unwrap_or(false) {
-                        prefix.push('?');
+                        name_part = format!("...{}", name_part);
+                    }
+                    if !a.required.unwrap_or(false) && !a.rest {
+                        name_part.push('?');
                     }
 
                     let ty = format_arg_type(&a.arg_type);
-                    format!("{}{}: {}", prefix, a.name, ty)
+                    format!("{}: {}", name_part, ty)
                 })
                 .collect();
             format!("{}[{}]", func.name, arg_parts.join("; "))
         }
         _ => {
-            if has_brackets {
+            if show_brackets {
                 format!("{}[]", func.name)
             } else {
                 func.name.clone()
@@ -1247,10 +1326,7 @@ fn build_usage_line_v2(func: &Function) -> String {
 }
 
 /// Build a `SignatureInformation` for signature help.
-fn build_signature_info(
-    func: &Function,
-    metadata: &MetadataManager,
-) -> lsp_types::SignatureInformation {
+fn build_signature_info(func: &Function) -> lsp_types::SignatureInformation {
     // Build the full label, e.g.  $send[channel: String; message: String; ?color: String]
     let label = build_usage_line_v2(func);
 
@@ -1261,36 +1337,28 @@ fn build_signature_info(
         let mut current_offset = func.name.len() + 1; // Start after '$func['
 
         for (idx, arg) in args.iter().enumerate() {
-            let mut prefix = String::new();
+            let mut name_part = arg.name.clone();
             if arg.rest {
-                prefix.push_str("...");
-            } else if !arg.required.unwrap_or(false) {
-                prefix.push('?');
+                name_part = format!("...{}", name_part);
+            }
+            if !arg.required.unwrap_or(false) && !arg.rest {
+                name_part.push('?');
             }
 
             let ty = format_arg_type(&arg.arg_type);
-            let rendered = format!("{}{}: {}", prefix, arg.name, ty);
+            let rendered = format!("{}: {}", name_part, ty);
 
             // Find this rendered arg in label starting from current_offset
             let param_start = current_offset;
             let param_end = param_start + rendered.len();
 
-            let mut doc_parts = Vec::new();
-            if !arg.description.is_empty() {
-                doc_parts.push(arg.description.clone());
-            }
-            let enum_hint = build_enum_hint(arg, metadata);
-            if !enum_hint.is_empty() {
-                doc_parts.push(enum_hint);
-            }
-
-            let doc = if doc_parts.is_empty() {
+            let doc = if arg.description.is_empty() {
                 None
             } else {
                 Some(lsp_types::Documentation::MarkupContent(
                     lsp_types::MarkupContent {
                         kind: lsp_types::MarkupKind::Markdown,
-                        value: doc_parts.join("\n\n"),
+                        value: arg.description.clone(),
                     },
                 ))
             };
@@ -1316,10 +1384,64 @@ fn build_signature_info(
         documentation: Some(lsp_types::Documentation::MarkupContent(
             lsp_types::MarkupContent {
                 kind: lsp_types::MarkupKind::Markdown,
-                value: format!("{}\n\n---", label),
+                value: "---".to_string(), // Just a separator, label is shown by IDE
             },
         )),
         parameters: Some(parameters),
         active_parameter: None,
+    }
+}
+
+// ============================================================================
+// Semantic Tokens helpers
+// ============================================================================
+
+struct RawSemanticToken {
+    line: u32,
+    start: u32,
+    length: u32,
+    token_type: u32,
+    modifier_mask: u32,
+}
+
+const TOKEN_TYPE_FUNCTION: u32 = 0;
+
+fn collect_semantic_tokens(node: &AstNode, text: &str, tokens: &mut Vec<RawSemanticToken>) {
+    match node {
+        AstNode::Program { body, .. } => {
+            for child in body {
+                collect_semantic_tokens(child, text, tokens);
+            }
+        }
+        AstNode::FunctionCall {
+            name,
+            name_span,
+            args,
+            ..
+        } => {
+            // Exclude $c
+            if name != "c" && name != "$c" {
+                let pos = byte_offset_to_position(text, name_span.start);
+                let length = (name_span.end - name_span.start) as u32;
+
+                tokens.push(RawSemanticToken {
+                    line: pos.line,
+                    start: pos.character,
+                    length,
+                    token_type: TOKEN_TYPE_FUNCTION,
+                    modifier_mask: 0,
+                });
+            }
+
+            // Recurse into arguments
+            if let Some(args) = args {
+                for arg in args {
+                    for part in &arg.parts {
+                        collect_semantic_tokens(part, text, tokens);
+                    }
+                }
+            }
+        }
+        _ => {}
     }
 }
