@@ -228,6 +228,8 @@ checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
 [[package]]
 name = "forge-kit"
 version = "0.1.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7906c2cd9484dee0caeae2dc76a6e82473c0b5de4eba00ecb41de0b3e25afe91"
 dependencies = [
  "dashmap 6.1.0",
  "regex",
