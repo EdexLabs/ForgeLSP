@@ -17,7 +17,9 @@ serde_json = "1"
 tower-lsp = "0.20"
 notify = { version = "6", features = ["macos_fsevent"] }
 dirs = "5"
-forge-kit = { version = "0.1.8", features = ["validation"] }
+forge-kit = { git = "https://github.com/edexlabs/ForgeKit", features = [
+  "validation",
+] }
 
 [profile.release]
 opt-level = 3
