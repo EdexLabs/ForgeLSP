@@ -252,19 +252,10 @@ impl ForgeLanguageServer {
     // Metadata disk cache
     // ========================================================================
 
-    /// Canonical path for the on-disk metadata cache.
-    ///
-    /// Resolution order:
-    /// 1. `config.cache_path` if provided by the extension
-    /// 2. `$XDG_CACHE_HOME/forgelsp/metadata.json` (Linux)  
-    ///    `~/Library/Caches/forgelsp/metadata.json` (macOS)  
-    ///    `%LOCALAPPDATA%\forgelsp\metadata.json` (Windows)
-    /// 3. `<temp-dir>/forgelsp-metadata.json` as a final fallback
     fn resolve_cache_path(config: &ForgeConfig) -> PathBuf {
         if let Some(p) = &config.cache_path {
             return PathBuf::from(p);
         }
-        // Try platform cache dir via the `dirs` crate
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(cache_dir) = dirs::cache_dir() {
             return cache_dir.join("forgelsp").join("metadata.json");
@@ -272,8 +263,6 @@ impl ForgeLanguageServer {
         std::env::temp_dir().join("forgelsp-metadata.json")
     }
 
-    /// Try to populate the metadata manager from the on-disk cache.
-    /// Returns `true` when the cache was loaded successfully.
     async fn try_load_cache(&self, cache_path: &PathBuf) -> bool {
         if !cache_path.exists() {
             return false;
@@ -308,9 +297,7 @@ impl ForgeLanguageServer {
         }
     }
 
-    /// Persist the current metadata to disk so it can be restored next startup.
     async fn save_cache(&self, cache_path: &PathBuf) {
-        // Ensure parent directory exists
         if let Some(parent) = cache_path.parent() {
             if let Err(e) = std::fs::create_dir_all(parent) {
                 self.client
@@ -350,22 +337,11 @@ impl ForgeLanguageServer {
     // custom_functions_path file-system watcher
     // ========================================================================
 
-    /// Spawn a `notify` watcher on `folder`.
-    ///
-    /// Any create / modify / remove event for a JS or TS file triggers a full
-    /// re-scan of the folder: the metadata manager clears its custom-function
-    /// entries, re-generates them from source, and all open documents are
-    /// re-parsed.
-    ///
-    /// We hold the `RecommendedWatcher` in `self._fs_watcher` so it is never
-    /// dropped while the server is alive.
     async fn start_custom_functions_watcher(&self, folder: PathBuf) {
         let metadata = Arc::clone(&self.metadata);
         let client = self.client.clone();
         let folder_clone = folder.clone();
 
-        // notify uses a synchronous callback, so we bridge into async via a
-        // tokio channel.
         let (tx, mut rx) = tokio::sync::mpsc::channel::<notify::Result<NotifyEvent>>(32);
 
         let watcher_result = RecommendedWatcher::new(
@@ -398,7 +374,6 @@ impl ForgeLanguageServer {
             return;
         }
 
-        // Store the watcher so it isn't dropped.
         *self._fs_watcher.lock().await = Some(watcher);
 
         client
@@ -411,22 +386,6 @@ impl ForgeLanguageServer {
             )
             .await;
 
-        // Spawn a background task that listens for events.
-        // We wrap `self` via Arc-cloned fields because the task must be
-        // `'static`.  We can't move `self` here, so we forward through the
-        // channel, and the calling site must own an Arc<Self> to continue the
-        // re-parse.  For simplicity we pass the components we need individually.
-        //
-        // NOTE: re-parsing all documents requires the documents map and the
-        // parse cache; those live on `self`.  The cleanest solution that avoids
-        // fighting the borrow-checker is to wrap ForgeLanguageServer in Arc and
-        // use a weak reference.  We approximate this here by forwarding only the
-        // metadata manager and client, then relying on `refresh_all_documents`
-        // being called from outside when practical.
-        //
-        // If your server is wrapped in Arc (tower-lsp's typical pattern), replace
-        // the comment below with `Arc::downgrade(&server_arc)` and upgrade it in
-        // the task to call `server.refresh_all_documents().await`.
         tokio::spawn(async move {
             while let Some(event_result) = rx.recv().await {
                 let event = match event_result {
@@ -442,7 +401,6 @@ impl ForgeLanguageServer {
                     }
                 };
 
-                // Only react to create / modify / remove events on JS/TS files.
                 let is_relevant = matches!(
                     event.kind,
                     EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
@@ -473,11 +431,6 @@ impl ForgeLanguageServer {
                     )
                     .await;
 
-                // Re-scan the whole folder and rebuild custom functions.
-                // The metadata manager keeps remote-fetched functions; we only
-                // want to replace the "custom" category.  The cleanest way is to
-                // clear custom entries and re-register, which requires a helper
-                // on MetadataManager.  We call the existing generation path.
                 match metadata.generate_custom_functions_json(&folder_clone) {
                     Ok(json) => {
                         match metadata.add_custom_functions_from_json(&json) {
@@ -488,10 +441,6 @@ impl ForgeLanguageServer {
                                         format!("ForgeLSP: reloaded {} custom function(s)", count),
                                     )
                                     .await;
-                                // Open documents will be re-parsed on the next
-                                // keystroke / save; for an immediate refresh the
-                                // server needs to be wrapped in Arc so we can call
-                                // `server.refresh_all_documents().await` here.
                             }
                             Err(e) => {
                                 client
@@ -533,7 +482,7 @@ impl LanguageServer for ForgeLanguageServer {
             }
         }
 
-        Ok(lsp_types::InitializeResult {
+        let result = lsp_types::InitializeResult {
             capabilities: lsp_types::ServerCapabilities {
                 text_document_sync: Some(lsp_types::TextDocumentSyncCapability::Kind(
                     lsp_types::TextDocumentSyncKind::FULL,
@@ -569,37 +518,44 @@ impl LanguageServer for ForgeLanguageServer {
                 ..lsp_types::ServerCapabilities::default()
             },
             ..lsp_types::InitializeResult::default()
-        })
+        };
+
+        self.client
+            .log_message(
+                lsp_types::MessageType::INFO,
+                format!("ForgeLSP: capabilities sent: {:?}", result.capabilities),
+            )
+            .await;
+
+        Ok(result)
     }
 
     async fn initialized(&self, _: lsp_types::InitializedParams) {
+        let config = self.pending_config.lock().await.take();
         self.client
-            .log_message(lsp_types::MessageType::INFO, "ForgeLSP initialized")
+            .log_message(
+                lsp_types::MessageType::INFO,
+                format!("ForgeLSP initialized, config: {:?}", config),
+            )
             .await;
 
-        let config = self.pending_config.lock().await.take();
         let config = match config {
             Some(c) => c,
             None => {
-                // No config — still do workspace scan with empty metadata.
                 self.scan_workspace().await;
                 return;
             }
         };
 
-        // ── 1. Load on-disk cache → instant diagnostics ───────────────────────
         let cache_path = Self::resolve_cache_path(&config);
         let cache_loaded = self.try_load_cache(&cache_path).await;
 
         if cache_loaded {
-            // Give editors a quick first pass with cached metadata.
             self.scan_workspace().await;
         }
 
-        // ── 2. Load custom functions (fast, local) ────────────────────────────
         self.load_custom_functions(&config).await;
 
-        // Start file watcher for the custom-functions folder if configured.
         if let Some(folder_path) = &config.custom_functions_path {
             let folder = PathBuf::from(folder_path);
             if folder.exists() && folder.is_dir() {
@@ -607,7 +563,6 @@ impl LanguageServer for ForgeLanguageServer {
             }
         }
 
-        // ── 3. Fetch fresh remote metadata in the background ──────────────────
         if let Some(urls) = &config.metadata_urls {
             for url_cfg in urls {
                 let mut source = MetadataSource::new(url_cfg.extension.clone());
@@ -632,16 +587,10 @@ impl LanguageServer for ForgeLanguageServer {
                         )
                         .await;
 
-                    // Save the updated cache so next startup is instant.
                     self.save_cache(&cache_path).await;
-
-                    // Re-parse everything with the fresh (possibly richer) metadata.
-                    // If workspace wasn't scanned yet (cache miss), do it now;
-                    // otherwise a second pass picks up any new diagnostics.
                     self.refresh_all_documents().await;
                 }
                 Err(e) => {
-                    // Network unavailable — the cached metadata is still active.
                     let msg = if cache_loaded {
                         format!(
                             "ForgeLSP: metadata fetch failed ({}); using cached data.",
@@ -657,8 +606,6 @@ impl LanguageServer for ForgeLanguageServer {
             }
         }
 
-        // If the cache was empty and there were no remote URLs, do the
-        // workspace scan now (it would already have been done above otherwise).
         if !cache_loaded {
             self.scan_workspace().await;
         }
@@ -679,6 +626,9 @@ impl LanguageServer for ForgeLanguageServer {
             let mut docs = self.documents.write().await;
             docs.insert(uri.clone(), text.clone());
         }
+        self.client
+            .log_message(lsp_types::MessageType::INFO, format!("did_open: {}", uri))
+            .await;
         self.refresh(uri, text).await;
     }
 
@@ -692,6 +642,9 @@ impl LanguageServer for ForgeLanguageServer {
             let mut docs = self.documents.write().await;
             docs.insert(uri.clone(), text.clone());
         }
+        self.client
+            .log_message(lsp_types::MessageType::INFO, format!("did_change: {}", uri))
+            .await;
         self.refresh(uri, text).await;
     }
 
@@ -716,6 +669,9 @@ impl LanguageServer for ForgeLanguageServer {
         &self,
         params: lsp_types::CompletionParams,
     ) -> Result<Option<lsp_types::CompletionResponse>> {
+        self.client
+            .log_message(lsp_types::MessageType::INFO, "completion called")
+            .await;
         let uri = &params.text_document_position.text_document.uri;
         let pos = params.text_document_position.position;
 
@@ -729,10 +685,28 @@ impl LanguageServer for ForgeLanguageServer {
 
         let cursor_offset = position_to_byte_offset(&text, pos);
 
+        // ── BUG 1 FIX ──────────────────────────────────────────────────────
+        // When the cursor is inside a function call's argument list, we first
+        // check whether this specific argument position has enum values. If it
+        // does, return those enum completions exclusively (that is intentional
+        // behaviour — e.g. you want only "true"/"false" for a boolean arg).
+        //
+        // BEFORE: if no enum values were found we would `return Ok(None)` here,
+        // suppressing ALL completions for any position inside a function call —
+        // including multi-line calls like `$if[...\n...\n]` where the 500-char
+        // newline guard in `find_arg_context` causes it to find an *inner* call
+        // (e.g. `$setMemberVar`) whose argument has no enum. That silently ate
+        // every completion request inside the block.
+        //
+        // FIX: only return early when we actually have enum completions to show.
+        // When there are no enum values, fall through to the prefix-based path
+        // so the user still gets function-name completions for nested calls.
+        // ───────────────────────────────────────────────────────────────────
         if let Some(ctx) = find_arg_context(&text, cursor_offset) {
             let func_name = format!("${}", ctx.func_name);
             if let Some(func) = self.metadata.get(&func_name) {
                 if let Some(enum_items) = get_enum_for_arg(&func, ctx.arg_index, &self.metadata) {
+                    // We have a definitive enum list — return it exclusively.
                     let items: Vec<lsp_types::CompletionItem> = enum_items
                         .into_iter()
                         .map(|val| lsp_types::CompletionItem {
@@ -763,8 +737,10 @@ impl LanguageServer for ForgeLanguageServer {
                         .collect();
                     return Ok(Some(lsp_types::CompletionResponse::Array(items)));
                 }
+                // No enum for this arg — fall through to prefix completions so
+                // the user can still type a nested $function call as the value.
             }
-            return Ok(None);
+            // Unknown function or no args — fall through as well.
         }
 
         let prefix = extract_dollar_prefix(&text, cursor_offset);
@@ -794,6 +770,9 @@ impl LanguageServer for ForgeLanguageServer {
     // ========================================================================
 
     async fn hover(&self, params: lsp_types::HoverParams) -> Result<Option<lsp_types::Hover>> {
+        self.client
+            .log_message(lsp_types::MessageType::INFO, "hover called")
+            .await;
         let uri = &params.text_document_position_params.text_document.uri;
         let pos = params.text_document_position_params.position;
 
@@ -815,10 +794,10 @@ impl LanguageServer for ForgeLanguageServer {
             }
         };
 
-        let (func_name, active_arg, depth) = match h_info {
-            Some(i) => (i.func_name, i.active_arg_index, i.depth),
+        let func_name = match h_info {
+            Some(i) => i.func_name,
             None => match find_function_name_at_offset(&text, cursor_offset) {
-                Some(name) => (name, None, 0),
+                Some(name) => name,
                 None => return Ok(None),
             },
         };
@@ -828,7 +807,7 @@ impl LanguageServer for ForgeLanguageServer {
             None => return Ok(None),
         };
 
-        let hover_md = build_hover_markdown(&func, active_arg, depth);
+        let hover_md = build_hover_markdown(&func);
 
         Ok(Some(lsp_types::Hover {
             contents: lsp_types::HoverContents::Markup(lsp_types::MarkupContent {
@@ -847,6 +826,9 @@ impl LanguageServer for ForgeLanguageServer {
         &self,
         params: lsp_types::SignatureHelpParams,
     ) -> Result<Option<lsp_types::SignatureHelp>> {
+        self.client
+            .log_message(lsp_types::MessageType::INFO, "signature_help called")
+            .await;
         let uri = &params.text_document_position_params.text_document.uri;
         let pos = params.text_document_position_params.position;
 
@@ -860,20 +842,36 @@ impl LanguageServer for ForgeLanguageServer {
 
         let cursor_offset = position_to_byte_offset(&text, pos);
 
+        // ── BUG 2 FIX ──────────────────────────────────────────────────────
+        // BEFORE: When the AST search returned None (cursor is outside every
+        // function call), the code fell back to `find_call_from_text()` which
+        // uses the 500-char backward scan. That scan crosses newlines and lands
+        // inside a *previous* function call's argument list, returning stale
+        // signature help for the wrong function.
+        //
+        // AFTER: The text-based fallback is used ONLY when there is no AST for
+        // this document yet (e.g. very first keystroke before the first parse
+        // completes). Once an AST is available its result is authoritative —
+        // if it says "no call here" we return None immediately instead of
+        // re-querying the unreliable text scan.
+        // ───────────────────────────────────────────────────────────────────
         let call_info = {
             let cache = self.parse_cache.read().await;
             match cache.get(uri) {
-                Some(cached) => find_call_for_sig_help(&cached.ast, cursor_offset),
-                None => None,
+                Some(cached) => {
+                    // AST is available — its answer is final.
+                    find_call_for_sig_help(&cached.ast, cursor_offset)
+                }
+                None => {
+                    // No AST yet — use text scan as a best-effort fallback.
+                    find_call_from_text(&text, cursor_offset)
+                }
             }
         };
 
         let call_info = match call_info {
             Some(c) => c,
-            None => match find_call_from_text(&text, cursor_offset) {
-                Some(c) => c,
-                None => return Ok(None),
-            },
+            None => return Ok(None),
         };
 
         let func = match self.metadata.get(&call_info.func_name) {
@@ -895,24 +893,66 @@ impl LanguageServer for ForgeLanguageServer {
         &self,
         params: lsp_types::SemanticTokensParams,
     ) -> Result<Option<lsp_types::SemanticTokensResult>> {
+        self.client
+            .log_message(lsp_types::MessageType::INFO, "semantic_tokens_full called")
+            .await;
+
         let uri = &params.text_document.uri;
+        self.client
+            .log_message(
+                lsp_types::MessageType::INFO,
+                format!("semantic_tokens uri: {}", uri),
+            )
+            .await;
 
         let text = {
             let docs = self.documents.read().await;
             match docs.get(uri) {
                 Some(t) => t.clone(),
-                None => return Ok(None),
+                None => {
+                    self.client
+                        .log_message(
+                            lsp_types::MessageType::WARNING,
+                            format!("semantic_tokens: document not found: {}", uri),
+                        )
+                        .await;
+                    return Ok(None);
+                }
             }
         };
 
         let cache = self.parse_cache.read().await;
         let ast = match cache.get(uri) {
             Some(cached) => &cached.ast,
-            None => return Ok(None),
+            None => {
+                self.client
+                    .log_message(
+                        lsp_types::MessageType::WARNING,
+                        "semantic_tokens: no AST cache",
+                    )
+                    .await;
+                return Ok(None);
+            }
         };
 
         let mut tokens = Vec::new();
         collect_semantic_tokens(ast, &text, &mut tokens);
+
+        if tokens.is_empty() {
+            self.client
+                .log_message(
+                    lsp_types::MessageType::WARNING,
+                    format!("semantic_tokens: No tokens collected for AST: {:?}", ast),
+                )
+                .await;
+        }
+
+        self.client
+            .log_message(
+                lsp_types::MessageType::INFO,
+                format!("semantic_tokens collected: {}", tokens.len()),
+            )
+            .await;
 
         tokens.sort_by(|a, b| {
             if a.line != b.line {
@@ -934,6 +974,14 @@ impl LanguageServer for ForgeLanguageServer {
                 token.start
             };
 
+            let token_info = format!(
+                "token: line={}, start={}, len={}, type={}, mod={}",
+                token.line, token.start, token.length, token.token_type, token.modifier_mask
+            );
+            self.client
+                .log_message(lsp_types::MessageType::LOG, token_info)
+                .await;
+
             data.push(lsp_types::SemanticToken {
                 delta_line: line_delta,
                 delta_start: char_delta,
@@ -945,6 +993,13 @@ impl LanguageServer for ForgeLanguageServer {
             last_line = token.line;
             last_char = token.start;
         }
+
+        self.client
+            .log_message(
+                lsp_types::MessageType::INFO,
+                format!("semantic_tokens returned: {}", data.len()),
+            )
+            .await;
 
         Ok(Some(lsp_types::SemanticTokensResult::Tokens(
             lsp_types::SemanticTokens {
@@ -1190,11 +1245,13 @@ fn format_arg_type(v: &serde_json::Value) -> String {
 }
 
 fn build_completion_item(func: &Function, text: &str, cursor: usize) -> lsp_types::CompletionItem {
-    let label = func.name.clone();
-    let insert_text = func.name.clone();
+    let raw_name = func.name.clone();
+    let label = raw_name.clone();
+    let insert_name = raw_name.strip_prefix('$').unwrap_or(&raw_name).to_string();
 
     let bytes = text.as_bytes();
     let mut start = cursor;
+
     while start > 0 {
         let b = bytes[start - 1];
         if b.is_ascii_alphanumeric() || b == b'_' {
@@ -1204,46 +1261,24 @@ fn build_completion_item(func: &Function, text: &str, cursor: usize) -> lsp_type
         }
     }
 
-    let id_start = start;
-
-    let mut first_dollar = id_start;
-    let mut found_any_dollar = false;
-    let mut search = id_start;
-    while search > 0 {
-        let b = bytes[search - 1];
-        if b == b'$' {
-            first_dollar = search - 1;
-            found_any_dollar = true;
-            search -= 1;
-        } else if b == b'!' || b == b'@' || b == b'#' || b == b'?' || b == b'&' {
-            search -= 1;
-        } else {
-            break;
-        }
-    }
-
-    let range = if found_any_dollar {
-        let start_pos = byte_offset_to_position(text, first_dollar);
-        let end_pos = byte_offset_to_position(text, cursor);
-        Some(lsp_types::Range {
-            start: start_pos,
-            end: end_pos,
-        })
-    } else {
-        None
+    let replace_range = lsp_types::Range {
+        start: byte_offset_to_position(text, start),
+        end: byte_offset_to_position(text, cursor),
     };
 
     let detail = first_sentence(&func.description);
     let doc = build_hover_markdown_for_completion(func);
 
     lsp_types::CompletionItem {
-        label,
+        label: label.clone(),
         kind: Some(lsp_types::CompletionItemKind::FUNCTION),
+
         detail: if detail.is_empty() {
             None
         } else {
             Some(detail)
         },
+
         documentation: if doc.is_empty() {
             None
         } else {
@@ -1254,17 +1289,12 @@ fn build_completion_item(func: &Function, text: &str, cursor: usize) -> lsp_type
                 },
             ))
         },
-        insert_text: Some(insert_text),
-        text_edit: range.map(|r| {
-            let modifiers = if found_any_dollar {
-                &text[first_dollar..id_start]
-            } else {
-                "$"
-            };
-            let new_text = format!("{}{}", modifiers, func.name);
 
-            lsp_types::CompletionTextEdit::Edit(lsp_types::TextEdit { range: r, new_text })
-        }),
+        text_edit: Some(lsp_types::CompletionTextEdit::Edit(lsp_types::TextEdit {
+            range: replace_range,
+            new_text: insert_name,
+        })),
+
         insert_text_format: Some(lsp_types::InsertTextFormat::PLAIN_TEXT),
         ..lsp_types::CompletionItem::default()
     }
@@ -1280,8 +1310,6 @@ fn first_sentence(s: &str) -> String {
 
 struct HoverInfo {
     func_name: String,
-    active_arg_index: Option<usize>,
-    depth: usize,
 }
 
 fn find_hover_info(node: &AstNode, offset: usize, current_depth: usize) -> Option<HoverInfo> {
@@ -1328,8 +1356,6 @@ fn find_hover_info(node: &AstNode, offset: usize, current_depth: usize) -> Optio
 
             Some(HoverInfo {
                 func_name: full_name,
-                active_arg_index: None,
-                depth: current_depth,
             })
         }
         _ => None,
@@ -1357,6 +1383,7 @@ fn find_call_for_sig_help(node: &AstNode, offset: usize) -> Option<CallInfo> {
             args,
             ..
         } => {
+            // Recurse into children first so the innermost call wins.
             if let Some(args) = args {
                 for arg in args {
                     for part in &arg.parts {
@@ -1368,7 +1395,19 @@ fn find_call_for_sig_help(node: &AstNode, offset: usize) -> Option<CallInfo> {
             }
 
             if let Some(aspan) = args_span {
-                if offset >= aspan.start && offset <= aspan.end {
+                // ── BUG 2a FIX ─────────────────────────────────────────────
+                // BEFORE: `offset <= aspan.end`
+                //
+                // The parser sets args_span.end = self.pos *after* advancing
+                // past the closing `]`, so args_span.end == position_of_] + 1.
+                // Using `<=` meant a cursor sitting exactly on the `]` character
+                // (offset == position_of_]) would satisfy the condition and
+                // incorrectly report being "inside" this call's argument list.
+                //
+                // FIX: use strict `<` so the cursor must be strictly before the
+                // closing `]` to be considered inside the argument list.
+                // ───────────────────────────────────────────────────────────
+                if offset >= aspan.start && offset < aspan.end {
                     let func_name = if name.starts_with('$') {
                         name.clone()
                     } else {
@@ -1432,7 +1471,7 @@ fn find_call_from_text(text: &str, cursor: usize) -> Option<CallInfo> {
 // Hover / Signature markdown builders
 // ============================================================================
 
-pub fn build_hover_markdown(func: &Function, _active_arg: Option<usize>, depth: usize) -> String {
+pub fn build_hover_markdown(func: &Function) -> String {
     let mut md = String::new();
 
     let usage = build_usage_line_v2(func);
@@ -1445,43 +1484,29 @@ pub fn build_hover_markdown(func: &Function, _active_arg: Option<usize>, depth: 
         md.push('\n');
     }
 
-    md.push('\n');
-    let mut badges: Vec<String> = Vec::new();
-    if let Some(ext) = &func.extension {
-        badges.push(format!("Extension: *{}*", ext));
-    }
-    if let Some(cat) = &func.category {
-        badges.push(format!("Category: *{}*", cat));
-    }
-    badges.push(format!("Depth: *{}*", depth));
-    if let Some(args) = &func.args {
-        badges.push(format!("Arguments: *{}*", args.len()));
-    }
-
-    if !badges.is_empty() {
-        md.push_str(&badges.join(" · "));
-        md.push('\n');
-    }
-
     if func.deprecated.unwrap_or(false) {
         md.push_str("\n> ⚠️ **Deprecated**\n");
     }
+
     if func.experimental.unwrap_or(false) {
         md.push_str("\n> 🧪 **Experimental**\n");
     }
 
     let mut links = Vec::new();
+
     if let Some(url) = &func.source_url {
         if let Some(github) = extract_github_url(url) {
             links.push(format!("[Github]({})", github));
         }
     }
+
     if let Some(ext) = &func.extension {
         links.push(format!(
             "[Documentation](https://docs.botforge.org/function/?p={})",
             ext
         ));
     }
+
     if !links.is_empty() {
         md.push_str("\n---\n");
         md.push_str(&links.join(" | "));
@@ -1490,7 +1515,6 @@ pub fn build_hover_markdown(func: &Function, _active_arg: Option<usize>, depth: 
 
     if let Some(aliases) = &func.aliases {
         if !aliases.is_empty() {
-            md.push('\n');
             let alias_list: Vec<String> = aliases
                 .iter()
                 .map(|a| {
@@ -1501,7 +1525,8 @@ pub fn build_hover_markdown(func: &Function, _active_arg: Option<usize>, depth: 
                     }
                 })
                 .collect();
-            md.push_str(&format!("**Aliases:** {}\n", alias_list.join(", ")));
+
+            md.push_str(&format!("\n**Aliases:** {}\n", alias_list.join(", ")));
         }
     }
 
@@ -1525,7 +1550,7 @@ fn extract_github_url(source_url: &str) -> Option<String> {
 }
 
 pub fn build_hover_markdown_for_completion(func: &Function) -> String {
-    build_hover_markdown(func, None, 0)
+    build_hover_markdown(func)
 }
 
 fn build_usage_line_v2(func: &Function) -> String {
