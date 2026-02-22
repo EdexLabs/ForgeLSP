@@ -25,15 +25,12 @@ struct MetadataUrlConfig {
     events: Option<String>,
 }
 
-/// Top-level initialization options sent by the extension via `initializationOptions`.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ForgeConfig {
     metadata_urls: Option<Vec<MetadataUrlConfig>>,
     custom_functions_path: Option<String>,
     custom_functions_json: Option<String>,
-    /// Optional explicit path for the metadata cache file.
-    /// Defaults to `<user-cache-dir>/forgelsp/metadata.json`.
     cache_path: Option<String>,
 }
 
@@ -55,8 +52,6 @@ pub struct ForgeLanguageServer {
     documents: RwLock<HashMap<lsp_types::Url, String>>,
     parse_cache: RwLock<HashMap<lsp_types::Url, CachedParse>>,
     pending_config: Mutex<Option<ForgeConfig>>,
-    /// The file-system watcher for `custom_functions_path`.
-    /// Keeping it alive here prevents the watcher from being dropped.
     _fs_watcher: Mutex<Option<RecommendedWatcher>>,
 }
 
@@ -415,22 +410,6 @@ impl ForgeLanguageServer {
                     continue;
                 }
 
-                let changed_files: Vec<PathBuf> = event.paths.clone();
-
-                client
-                    .log_message(
-                        lsp_types::MessageType::INFO,
-                        format!(
-                            "ForgeLSP: custom-functions changed ({:?}), reloading…",
-                            changed_files
-                                .iter()
-                                .filter_map(|p| p.file_name())
-                                .map(|n| n.to_string_lossy().to_string())
-                                .collect::<Vec<_>>()
-                        ),
-                    )
-                    .await;
-
                 match metadata.generate_custom_functions_json(&folder_clone) {
                     Ok(json) => {
                         match metadata.add_custom_functions_from_json(&json) {
@@ -520,13 +499,6 @@ impl LanguageServer for ForgeLanguageServer {
             ..lsp_types::InitializeResult::default()
         };
 
-        self.client
-            .log_message(
-                lsp_types::MessageType::INFO,
-                format!("ForgeLSP: capabilities sent: {:?}", result.capabilities),
-            )
-            .await;
-
         Ok(result)
     }
 
@@ -535,7 +507,7 @@ impl LanguageServer for ForgeLanguageServer {
         self.client
             .log_message(
                 lsp_types::MessageType::INFO,
-                format!("ForgeLSP initialized, config: {:?}", config),
+                format!("ForgeLSP initialized"),
             )
             .await;
 
@@ -626,9 +598,6 @@ impl LanguageServer for ForgeLanguageServer {
             let mut docs = self.documents.write().await;
             docs.insert(uri.clone(), text.clone());
         }
-        self.client
-            .log_message(lsp_types::MessageType::INFO, format!("did_open: {}", uri))
-            .await;
         self.refresh(uri, text).await;
     }
 
@@ -642,9 +611,6 @@ impl LanguageServer for ForgeLanguageServer {
             let mut docs = self.documents.write().await;
             docs.insert(uri.clone(), text.clone());
         }
-        self.client
-            .log_message(lsp_types::MessageType::INFO, format!("did_change: {}", uri))
-            .await;
         self.refresh(uri, text).await;
     }
 
@@ -669,9 +635,6 @@ impl LanguageServer for ForgeLanguageServer {
         &self,
         params: lsp_types::CompletionParams,
     ) -> Result<Option<lsp_types::CompletionResponse>> {
-        self.client
-            .log_message(lsp_types::MessageType::INFO, "completion called")
-            .await;
         let uri = &params.text_document_position.text_document.uri;
         let pos = params.text_document_position.position;
 
@@ -685,23 +648,6 @@ impl LanguageServer for ForgeLanguageServer {
 
         let cursor_offset = position_to_byte_offset(&text, pos);
 
-        // ── BUG 1 FIX ──────────────────────────────────────────────────────
-        // When the cursor is inside a function call's argument list, we first
-        // check whether this specific argument position has enum values. If it
-        // does, return those enum completions exclusively (that is intentional
-        // behaviour — e.g. you want only "true"/"false" for a boolean arg).
-        //
-        // BEFORE: if no enum values were found we would `return Ok(None)` here,
-        // suppressing ALL completions for any position inside a function call —
-        // including multi-line calls like `$if[...\n...\n]` where the 500-char
-        // newline guard in `find_arg_context` causes it to find an *inner* call
-        // (e.g. `$setMemberVar`) whose argument has no enum. That silently ate
-        // every completion request inside the block.
-        //
-        // FIX: only return early when we actually have enum completions to show.
-        // When there are no enum values, fall through to the prefix-based path
-        // so the user still gets function-name completions for nested calls.
-        // ───────────────────────────────────────────────────────────────────
         if let Some(ctx) = find_arg_context(&text, cursor_offset) {
             let func_name = format!("${}", ctx.func_name);
             if let Some(func) = self.metadata.get(&func_name) {
@@ -770,9 +716,6 @@ impl LanguageServer for ForgeLanguageServer {
     // ========================================================================
 
     async fn hover(&self, params: lsp_types::HoverParams) -> Result<Option<lsp_types::Hover>> {
-        self.client
-            .log_message(lsp_types::MessageType::INFO, "hover called")
-            .await;
         let uri = &params.text_document_position_params.text_document.uri;
         let pos = params.text_document_position_params.position;
 
@@ -826,9 +769,6 @@ impl LanguageServer for ForgeLanguageServer {
         &self,
         params: lsp_types::SignatureHelpParams,
     ) -> Result<Option<lsp_types::SignatureHelp>> {
-        self.client
-            .log_message(lsp_types::MessageType::INFO, "signature_help called")
-            .await;
         let uri = &params.text_document_position_params.text_document.uri;
         let pos = params.text_document_position_params.position;
 
@@ -842,30 +782,11 @@ impl LanguageServer for ForgeLanguageServer {
 
         let cursor_offset = position_to_byte_offset(&text, pos);
 
-        // ── BUG 2 FIX ──────────────────────────────────────────────────────
-        // BEFORE: When the AST search returned None (cursor is outside every
-        // function call), the code fell back to `find_call_from_text()` which
-        // uses the 500-char backward scan. That scan crosses newlines and lands
-        // inside a *previous* function call's argument list, returning stale
-        // signature help for the wrong function.
-        //
-        // AFTER: The text-based fallback is used ONLY when there is no AST for
-        // this document yet (e.g. very first keystroke before the first parse
-        // completes). Once an AST is available its result is authoritative —
-        // if it says "no call here" we return None immediately instead of
-        // re-querying the unreliable text scan.
-        // ───────────────────────────────────────────────────────────────────
         let call_info = {
             let cache = self.parse_cache.read().await;
             match cache.get(uri) {
-                Some(cached) => {
-                    // AST is available — its answer is final.
-                    find_call_for_sig_help(&cached.ast, cursor_offset)
-                }
-                None => {
-                    // No AST yet — use text scan as a best-effort fallback.
-                    find_call_from_text(&text, cursor_offset)
-                }
+                Some(cached) => find_call_for_sig_help(&cached.ast, cursor_offset),
+                None => find_call_from_text(&text, cursor_offset),
             }
         };
 
@@ -893,17 +814,7 @@ impl LanguageServer for ForgeLanguageServer {
         &self,
         params: lsp_types::SemanticTokensParams,
     ) -> Result<Option<lsp_types::SemanticTokensResult>> {
-        self.client
-            .log_message(lsp_types::MessageType::INFO, "semantic_tokens_full called")
-            .await;
-
         let uri = &params.text_document.uri;
-        self.client
-            .log_message(
-                lsp_types::MessageType::INFO,
-                format!("semantic_tokens uri: {}", uri),
-            )
-            .await;
 
         let text = {
             let docs = self.documents.read().await;
@@ -938,22 +849,6 @@ impl LanguageServer for ForgeLanguageServer {
         let mut tokens = Vec::new();
         collect_semantic_tokens(ast, &text, &mut tokens);
 
-        if tokens.is_empty() {
-            self.client
-                .log_message(
-                    lsp_types::MessageType::WARNING,
-                    format!("semantic_tokens: No tokens collected for AST: {:?}", ast),
-                )
-                .await;
-        }
-
-        self.client
-            .log_message(
-                lsp_types::MessageType::INFO,
-                format!("semantic_tokens collected: {}", tokens.len()),
-            )
-            .await;
-
         tokens.sort_by(|a, b| {
             if a.line != b.line {
                 a.line.cmp(&b.line)
@@ -974,14 +869,6 @@ impl LanguageServer for ForgeLanguageServer {
                 token.start
             };
 
-            let token_info = format!(
-                "token: line={}, start={}, len={}, type={}, mod={}",
-                token.line, token.start, token.length, token.token_type, token.modifier_mask
-            );
-            self.client
-                .log_message(lsp_types::MessageType::LOG, token_info)
-                .await;
-
             data.push(lsp_types::SemanticToken {
                 delta_line: line_delta,
                 delta_start: char_delta,
@@ -993,13 +880,6 @@ impl LanguageServer for ForgeLanguageServer {
             last_line = token.line;
             last_char = token.start;
         }
-
-        self.client
-            .log_message(
-                lsp_types::MessageType::INFO,
-                format!("semantic_tokens returned: {}", data.len()),
-            )
-            .await;
 
         Ok(Some(lsp_types::SemanticTokensResult::Tokens(
             lsp_types::SemanticTokens {
@@ -1395,18 +1275,6 @@ fn find_call_for_sig_help(node: &AstNode, offset: usize) -> Option<CallInfo> {
             }
 
             if let Some(aspan) = args_span {
-                // ── BUG 2a FIX ─────────────────────────────────────────────
-                // BEFORE: `offset <= aspan.end`
-                //
-                // The parser sets args_span.end = self.pos *after* advancing
-                // past the closing `]`, so args_span.end == position_of_] + 1.
-                // Using `<=` meant a cursor sitting exactly on the `]` character
-                // (offset == position_of_]) would satisfy the condition and
-                // incorrectly report being "inside" this call's argument list.
-                //
-                // FIX: use strict `<` so the cursor must be strictly before the
-                // closing `]` to be considered inside the argument list.
-                // ───────────────────────────────────────────────────────────
                 if offset >= aspan.start && offset < aspan.end {
                     let func_name = if name.starts_with('$') {
                         name.clone()

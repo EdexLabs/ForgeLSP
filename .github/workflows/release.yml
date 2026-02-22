@@ -95,6 +95,6 @@ jobs:
           name: Release (${{ github.ref_name }})
           files: dist/**/*
           draft: false
-          prerelease: true
+          prerelease: false
         env:
           GITHUB_TOKEN: ${{ secrets.TOKEN }}
