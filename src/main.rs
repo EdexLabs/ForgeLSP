@@ -11,4 +11,3 @@ async fn main() {
     let (service, socket) = LspService::new(ForgeLanguageServer::new);
     Server::new(stdin, stdout, socket).serve(service).await;
 }
- 
