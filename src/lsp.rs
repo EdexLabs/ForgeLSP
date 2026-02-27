@@ -489,11 +489,11 @@ impl LanguageServer for ForgeLanguageServer {
                                 token_modifiers: vec![],
                             },
                             full: Some(lsp_types::SemanticTokensFullOptions::Bool(true)),
-                            range: Some(false),
                             ..lsp_types::SemanticTokensOptions::default()
                         },
                     ),
                 ),
+                definition_provider: Some(lsp_types::OneOf::Left(true)),
                 ..lsp_types::ServerCapabilities::default()
             },
             ..lsp_types::InitializeResult::default()
@@ -887,6 +887,68 @@ impl LanguageServer for ForgeLanguageServer {
                 data,
             },
         )))
+    }
+
+    async fn goto_definition(
+        &self,
+        params: lsp_types::GotoDefinitionParams,
+    ) -> Result<Option<lsp_types::GotoDefinitionResponse>> {
+        let uri = &params.text_document_position_params.text_document.uri;
+        let pos = params.text_document_position_params.position;
+
+        let text = {
+            let docs = self.documents.read().await;
+            match docs.get(uri) {
+                Some(t) => t.clone(),
+                None => return Ok(None),
+            }
+        };
+
+        let cursor_offset = position_to_byte_offset(&text, pos);
+
+        let h_info = {
+            let cache = self.parse_cache.read().await;
+            match cache.get(uri) {
+                Some(cached) => find_hover_info(&cached.ast, cursor_offset, 0),
+                None => None,
+            }
+        };
+
+        let func_name = match h_info {
+            Some(i) => i.func_name,
+            None => match find_function_name_at_offset(&text, cursor_offset) {
+                Some(name) => name,
+                None => return Ok(None),
+            },
+        };
+
+        let func = match self.metadata.get(&func_name) {
+            Some(f) => f,
+            None => return Ok(None),
+        };
+
+        if let Some(path) = &func.local_path {
+            if let Ok(uri) = lsp_types::Url::from_file_path(path) {
+                let line = func.line.unwrap_or(0);
+                return Ok(Some(lsp_types::GotoDefinitionResponse::Scalar(
+                    lsp_types::Location {
+                        uri,
+                        range: lsp_types::Range {
+                            start: lsp_types::Position {
+                                line: line as u32,
+                                character: 0,
+                            },
+                            end: lsp_types::Position {
+                                line: line as u32,
+                                character: 0,
+                            },
+                        },
+                    },
+                )));
+            }
+        }
+
+        Ok(None)
     }
 }
 
@@ -1344,6 +1406,11 @@ pub fn build_hover_markdown(func: &Function) -> String {
 
     let usage = build_usage_line_v2(func);
     md.push_str(&format!("```forge\n{}\n```", usage));
+
+    if let Some(ext) = &func.extension {
+        md.push_str(&format!("\n*{}*\n", ext));
+    }
+
     md.push_str("\n---\n");
 
     if !func.description.is_empty() {
