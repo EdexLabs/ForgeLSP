@@ -1438,7 +1438,8 @@ pub fn build_hover_markdown(func: &Function) -> String {
     if let Some(ext) = &func.extension {
         let name = ext.split('/').last().unwrap_or(ext);
         links.push(format!(
-            "[Documentation](https://docs.botforge.org/function/?p={})",
+            "[Documentation](https://docs.botforge.org/{}/?p={})",
+            strip_dollar(&func.name),
             name
         ));
     }
