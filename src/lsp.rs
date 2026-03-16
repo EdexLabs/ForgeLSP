@@ -1818,8 +1818,8 @@ fn collect_folding_ranges(node: &AstNode, text: &str, ranges: &mut Vec<lsp_types
                 ranges.push(lsp_types::FoldingRange {
                     start_line: start_pos.line,
                     start_character: Some(start_pos.character),
-                    end_line: end_pos.line,
-                    end_character: Some(end_pos.character),
+                    end_line: end_pos.line - 1,
+                    end_character: None, // Ignore end character when hiding lines
                     kind: Some(lsp_types::FoldingRangeKind::Region),
                     ..lsp_types::FoldingRange::default()
                 });
