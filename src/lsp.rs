@@ -656,6 +656,8 @@ impl LanguageServer for ForgeLanguageServer {
         if !cache_loaded {
             self.scan_workspace().await;
         }
+
+        self.refresh_all_documents().await;
     }
 
     async fn shutdown(&self) -> Result<()> {
