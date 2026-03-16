@@ -16,7 +16,7 @@ use tower_lsp::{Client, LanguageServer};
 // Config types received from the VS Code extension
 // ============================================================================
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct MetadataUrlConfig {
     extension: String,
@@ -25,13 +25,30 @@ struct MetadataUrlConfig {
     events: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
+#[serde(untagged)]
+enum CustomFunctionsPath {
+    Single(String),
+    Multiple(Vec<String>),
+}
+
+impl CustomFunctionsPath {
+    fn to_vec(&self) -> Vec<String> {
+        match self {
+            Self::Single(s) => vec![s.clone()],
+            Self::Multiple(v) => v.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct ForgeConfig {
     metadata_urls: Option<Vec<MetadataUrlConfig>>,
-    custom_functions_path: Option<String>,
+    custom_functions_path: Option<CustomFunctionsPath>,
     custom_functions_json: Option<String>,
     cache_path: Option<String>,
+    custom_colors: Option<Vec<String>>,
 }
 
 // ============================================================================
@@ -51,6 +68,7 @@ pub struct ForgeLanguageServer {
     metadata: Arc<MetadataManager>,
     documents: RwLock<HashMap<lsp_types::Url, String>>,
     parse_cache: RwLock<HashMap<lsp_types::Url, CachedParse>>,
+    config: RwLock<Option<ForgeConfig>>,
     pending_config: Mutex<Option<ForgeConfig>>,
     _fs_watcher: Mutex<Option<RecommendedWatcher>>,
 }
@@ -62,6 +80,7 @@ impl ForgeLanguageServer {
             metadata: Arc::new(MetadataManager::new()),
             documents: RwLock::new(HashMap::new()),
             parse_cache: RwLock::new(HashMap::new()),
+            config: RwLock::new(None),
             pending_config: Mutex::new(None),
             _fs_watcher: Mutex::new(None),
         }
@@ -80,6 +99,35 @@ impl ForgeLanguageServer {
         } else {
             parser::parse_forge_script_with_validation(&text, config, self.metadata.clone())
         };
+
+        if let Some(cfg) = self.config.read().await.as_ref() {
+            if let Some(colors) = &cfg.custom_colors {
+                if !colors.is_empty() {
+                    let mut color_tokens = Vec::new();
+                    collect_custom_color_tokens(&ast, &text, &mut color_tokens, colors.len());
+
+                    #[derive(serde::Serialize, serde::Deserialize)]
+                    struct CustomColorNotification {
+                        uri: lsp_types::Url,
+                        tokens: Vec<CustomColorToken>,
+                    }
+
+                    impl tower_lsp::lsp_types::notification::Notification for CustomColorNotification {
+                        type Params = CustomColorNotification;
+                        const METHOD: &'static str = "forge/customColors";
+                    }
+
+                    self.client
+                        .send_notification::<CustomColorNotification>(
+                            CustomColorNotification {
+                                uri: uri.clone(),
+                                tokens: color_tokens,
+                            },
+                        )
+                        .await;
+                }
+            }
+        }
 
         {
             let mut cache = self.parse_cache.write().await;
@@ -190,55 +238,57 @@ impl ForgeLanguageServer {
             }
         }
 
-        if let Some(folder_path) = &config.custom_functions_path {
-            let folder = PathBuf::from(folder_path);
-            if folder.exists() && folder.is_dir() {
-                match self.metadata.generate_custom_functions_json(&folder) {
-                    Ok(json) => match self.metadata.add_custom_functions_from_json(&json) {
-                        Ok(count) => {
-                            self.client
-                                .log_message(
-                                    lsp_types::MessageType::INFO,
-                                    format!(
-                                        "Loaded {} custom function(s) from folder: {}",
-                                        count,
-                                        folder.display()
-                                    ),
-                                )
-                                .await;
-                        }
+        if let Some(cf_path) = &config.custom_functions_path {
+            for folder_path in cf_path.to_vec() {
+                let folder = PathBuf::from(&folder_path);
+                if folder.exists() && folder.is_dir() {
+                    match self.metadata.generate_custom_functions_json(&folder) {
+                        Ok(json) => match self.metadata.add_custom_functions_from_json(&json) {
+                            Ok(count) => {
+                                self.client
+                                    .log_message(
+                                        lsp_types::MessageType::INFO,
+                                        format!(
+                                            "Loaded {} custom function(s) from folder: {}",
+                                            count,
+                                            folder.display()
+                                        ),
+                                    )
+                                    .await;
+                            }
+                            Err(e) => {
+                                self.client
+                                    .log_message(
+                                        lsp_types::MessageType::WARNING,
+                                        format!("Failed to register custom functions: {}", e),
+                                    )
+                                    .await;
+                            }
+                        },
                         Err(e) => {
                             self.client
                                 .log_message(
                                     lsp_types::MessageType::WARNING,
-                                    format!("Failed to register custom functions: {}", e),
+                                    format!(
+                                        "Failed to parse custom functions from {}: {}",
+                                        folder.display(),
+                                        e
+                                    ),
                                 )
                                 .await;
                         }
-                    },
-                    Err(e) => {
-                        self.client
-                            .log_message(
-                                lsp_types::MessageType::WARNING,
-                                format!(
-                                    "Failed to parse custom functions from {}: {}",
-                                    folder.display(),
-                                    e
-                                ),
-                            )
-                            .await;
                     }
+                } else {
+                    self.client
+                        .log_message(
+                            lsp_types::MessageType::WARNING,
+                            format!(
+                                "custom_functions_path is not a directory: {}",
+                                folder.display()
+                            ),
+                        )
+                        .await;
                 }
-            } else {
-                self.client
-                    .log_message(
-                        lsp_types::MessageType::WARNING,
-                        format!(
-                            "custom_functions_path is not a directory: {}",
-                            folder.display()
-                        ),
-                    )
-                    .await;
             }
         }
     }
@@ -332,10 +382,14 @@ impl ForgeLanguageServer {
     // custom_functions_path file-system watcher
     // ========================================================================
 
-    async fn start_custom_functions_watcher(&self, folder: PathBuf) {
+    async fn start_custom_functions_watcher(&self, folders: Vec<PathBuf>) {
+        if folders.is_empty() {
+            return;
+        }
+
         let metadata = Arc::clone(&self.metadata);
         let client = self.client.clone();
-        let folder_clone = folder.clone();
+        let folders_clone = folders.clone();
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<notify::Result<NotifyEvent>>(32);
 
@@ -359,27 +413,31 @@ impl ForgeLanguageServer {
             }
         };
 
-        if let Err(e) = watcher.watch(&folder, RecursiveMode::Recursive) {
-            client
-                .log_message(
-                    lsp_types::MessageType::WARNING,
-                    format!("ForgeLSP: cannot watch {}: {}", folder.display(), e),
-                )
-                .await;
-            return;
+        for folder in &folders {
+            if let Err(e) = watcher.watch(folder, RecursiveMode::Recursive) {
+                client
+                    .log_message(
+                        lsp_types::MessageType::WARNING,
+                        format!("ForgeLSP: cannot watch {}: {}", folder.display(), e),
+                    )
+                    .await;
+                return;
+            }
         }
 
         *self._fs_watcher.lock().await = Some(watcher);
 
-        client
-            .log_message(
-                lsp_types::MessageType::INFO,
-                format!(
-                    "ForgeLSP: watching custom-functions folder: {}",
-                    folder.display()
-                ),
-            )
-            .await;
+        for folder in &folders {
+            client
+                .log_message(
+                    lsp_types::MessageType::INFO,
+                    format!(
+                        "ForgeLSP: watching custom-functions folder: {}",
+                        folder.display()
+                    ),
+                )
+                .await;
+        }
 
         tokio::spawn(async move {
             while let Some(event_result) = rx.recv().await {
@@ -410,34 +468,36 @@ impl ForgeLanguageServer {
                     continue;
                 }
 
-                match metadata.generate_custom_functions_json(&folder_clone) {
-                    Ok(json) => {
-                        match metadata.add_custom_functions_from_json(&json) {
-                            Ok(count) => {
-                                client
+                for folder_path in &folders_clone {
+                    match metadata.generate_custom_functions_json(folder_path) {
+                        Ok(json) => {
+                            match metadata.add_custom_functions_from_json(&json) {
+                                Ok(count) => {
+                                    client
+                                        .log_message(
+                                            lsp_types::MessageType::INFO,
+                                            format!("ForgeLSP: reloaded {} custom function(s) from {}", count, folder_path.display()),
+                                        )
+                                        .await;
+                                }
+                                Err(e) => {
+                                    client
                                     .log_message(
-                                        lsp_types::MessageType::INFO,
-                                        format!("ForgeLSP: reloaded {} custom function(s)", count),
+                                        lsp_types::MessageType::WARNING,
+                                        format!("ForgeLSP: failed to register updated custom functions from {}: {}", folder_path.display(), e),
                                     )
                                     .await;
-                            }
-                            Err(e) => {
-                                client
-                                .log_message(
-                                    lsp_types::MessageType::WARNING,
-                                    format!("ForgeLSP: failed to register updated custom functions: {}", e),
-                                )
-                                .await;
+                                }
                             }
                         }
-                    }
-                    Err(e) => {
-                        client
-                            .log_message(
-                                lsp_types::MessageType::WARNING,
-                                format!("ForgeLSP: failed to parse custom functions: {}", e),
-                            )
-                            .await;
+                        Err(e) => {
+                            client
+                                .log_message(
+                                    lsp_types::MessageType::WARNING,
+                                    format!("ForgeLSP: failed to parse custom functions from {}: {}", folder_path.display(), e),
+                                )
+                                .await;
+                        }
                     }
                 }
             }
@@ -481,19 +541,24 @@ impl LanguageServer for ForgeLanguageServer {
                     retrigger_characters: Some(vec![";".to_string()]),
                     ..lsp_types::SignatureHelpOptions::default()
                 }),
-                semantic_tokens_provider: Some(
-                    lsp_types::SemanticTokensServerCapabilities::SemanticTokensOptions(
-                        lsp_types::SemanticTokensOptions {
-                            legend: lsp_types::SemanticTokensLegend {
-                                token_types: vec![lsp_types::SemanticTokenType::FUNCTION],
-                                token_modifiers: vec![],
+                semantic_tokens_provider: if self.pending_config.lock().await.as_ref().and_then(|c| c.custom_colors.as_ref()).is_some() {
+                    None
+                } else {
+                    Some(
+                        lsp_types::SemanticTokensServerCapabilities::SemanticTokensOptions(
+                            lsp_types::SemanticTokensOptions {
+                                legend: lsp_types::SemanticTokensLegend {
+                                    token_types: vec![lsp_types::SemanticTokenType::FUNCTION],
+                                    token_modifiers: vec![],
+                                },
+                                full: Some(lsp_types::SemanticTokensFullOptions::Bool(true)),
+                                ..lsp_types::SemanticTokensOptions::default()
                             },
-                            full: Some(lsp_types::SemanticTokensFullOptions::Bool(true)),
-                            ..lsp_types::SemanticTokensOptions::default()
-                        },
-                    ),
-                ),
+                        ),
+                    )
+                },
                 definition_provider: Some(lsp_types::OneOf::Left(true)),
+                folding_range_provider: Some(lsp_types::FoldingRangeProviderCapability::Simple(true)),
                 ..lsp_types::ServerCapabilities::default()
             },
             ..lsp_types::InitializeResult::default()
@@ -512,7 +577,11 @@ impl LanguageServer for ForgeLanguageServer {
             .await;
 
         let config = match config {
-            Some(c) => c,
+            Some(c) => {
+                let mut guard = self.config.write().await;
+                *guard = Some(c.clone());
+                c
+            }
             None => {
                 self.scan_workspace().await;
                 return;
@@ -528,10 +597,16 @@ impl LanguageServer for ForgeLanguageServer {
 
         self.load_custom_functions(&config).await;
 
-        if let Some(folder_path) = &config.custom_functions_path {
-            let folder = PathBuf::from(folder_path);
-            if folder.exists() && folder.is_dir() {
-                self.start_custom_functions_watcher(folder).await;
+        if let Some(cf_path) = &config.custom_functions_path {
+            let mut folders = Vec::new();
+            for folder_path in cf_path.to_vec() {
+                let folder = PathBuf::from(folder_path);
+                if folder.exists() && folder.is_dir() {
+                    folders.push(folder);
+                }
+            }
+            if !folders.is_empty() {
+                self.start_custom_functions_watcher(folders).await;
             }
         }
 
@@ -949,6 +1024,32 @@ impl LanguageServer for ForgeLanguageServer {
         }
 
         Ok(None)
+    }
+
+    async fn folding_range(
+        &self,
+        params: lsp_types::FoldingRangeParams,
+    ) -> Result<Option<Vec<lsp_types::FoldingRange>>> {
+        let uri = &params.text_document.uri;
+
+        let text = {
+            let docs = self.documents.read().await;
+            match docs.get(uri) {
+                Some(t) => t.clone(),
+                None => return Ok(None),
+            }
+        };
+
+        let cache = self.parse_cache.read().await;
+        let ast = match cache.get(uri) {
+            Some(cached) => &cached.ast,
+            None => return Ok(None),
+        };
+
+        let mut ranges = Vec::new();
+        collect_folding_ranges(ast, &text, &mut ranges);
+
+        Ok(Some(ranges))
     }
 }
 
@@ -1634,6 +1735,100 @@ fn collect_semantic_tokens(node: &AstNode, text: &str, tokens: &mut Vec<RawSeman
                 for arg in args {
                     for part in &arg.parts {
                         collect_semantic_tokens(part, text, tokens);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CustomColorToken {
+    range: lsp_types::Range,
+    color_index: usize,
+}
+
+fn collect_custom_color_tokens(
+    node: &AstNode,
+    text: &str,
+    tokens: &mut Vec<CustomColorToken>,
+    color_count: usize,
+) {
+    let mut state = 0;
+    collect_custom_color_tokens_inner(node, text, tokens, color_count, &mut state);
+}
+
+fn collect_custom_color_tokens_inner(
+    node: &AstNode,
+    text: &str,
+    tokens: &mut Vec<CustomColorToken>,
+    color_count: usize,
+    state: &mut usize,
+) {
+    match node {
+        AstNode::Program { body, .. } => {
+            for child in body {
+                collect_custom_color_tokens_inner(child, text, tokens, color_count, state);
+            }
+        }
+        AstNode::FunctionCall {
+            name,
+            name_span,
+            args,
+            ..
+        } => {
+            if name != "c" && name != "$c" {
+                let range = span_to_range(text, *name_span);
+                tokens.push(CustomColorToken {
+                    range,
+                    color_index: *state % color_count,
+                });
+                *state += 1;
+            }
+
+            if let Some(args) = args {
+                for arg in args {
+                    for part in &arg.parts {
+                        collect_custom_color_tokens_inner(part, text, tokens, color_count, state);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+// ============================================================================
+// Folding Range helpers
+// ============================================================================
+
+fn collect_folding_ranges(node: &AstNode, text: &str, ranges: &mut Vec<lsp_types::FoldingRange>) {
+    match node {
+        AstNode::Program { body, .. } => {
+            for child in body {
+                collect_folding_ranges(child, text, ranges);
+            }
+        }
+        AstNode::FunctionCall { span, args, .. } => {
+            let start_pos = byte_offset_to_position(text, span.start);
+            let end_pos = byte_offset_to_position(text, span.end);
+
+            if start_pos.line < end_pos.line {
+                ranges.push(lsp_types::FoldingRange {
+                    start_line: start_pos.line,
+                    start_character: Some(start_pos.character),
+                    end_line: end_pos.line,
+                    end_character: Some(end_pos.character),
+                    kind: Some(lsp_types::FoldingRangeKind::Region),
+                    ..lsp_types::FoldingRange::default()
+                });
+            }
+
+            if let Some(args) = args {
+                for arg in args {
+                    for part in &arg.parts {
+                        collect_folding_ranges(part, text, ranges);
                     }
                 }
             }
