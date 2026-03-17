@@ -611,7 +611,12 @@ impl LanguageServer for ForgeLanguageServer {
                 return;
             }
         };
-
+        self.client
+            .log_message(
+                lsp_types::MessageType::INFO,
+                format!("ForgeLSP: config loaded - {:?}", config),
+            )
+            .await;
         let cache_path = Self::resolve_cache_path(&config);
         let cache_loaded = self.try_load_cache(&cache_path).await;
 
