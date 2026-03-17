@@ -5,10 +5,11 @@ on:
     branches:
       - "main"
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   build:
-    permissions:
-      contents: write
     strategy:
       fail-fast: false
       matrix:
@@ -83,19 +84,22 @@ jobs:
     name: Create or Update GitHub Release
     needs: [build]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
 
     steps:
       - name: Download Artifacts
         uses: actions/download-artifact@v4
         with:
           path: dist
+          merge-multiple: true
 
       - name: Create or Update Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_name }}
-          name: Release (${{ github.ref_name }})
-          files: dist/**/*
+          tag_name: latest
+          name: Release (${{ github.sha }})
+          files: dist/*
           draft: false
           prerelease: false
         env:
