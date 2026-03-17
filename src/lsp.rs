@@ -49,6 +49,12 @@ struct ForgeConfig {
     custom_functions_json: Option<String>,
     cache_path: Option<String>,
     custom_colors: Option<Vec<String>>,
+
+    /// Set to `true` only by the ForgeZed extension.
+    /// Enables additional semantic token types: string, number, boolean,
+    /// and rainbow bracket coloring.
+    #[serde(default)]
+    enable_zed_tokens: bool,
 }
 
 // ============================================================================
@@ -452,17 +458,11 @@ impl ForgeLanguageServer {
                     }
                 };
 
-                let is_relevant = matches!(
+                let is_modify = matches!(
                     event.kind,
                     EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
-                ) && event.paths.iter().any(|p| {
-                    p.extension()
-                        .and_then(|e| e.to_str())
-                        .map(|e| e == "js" || e == "ts")
-                        .unwrap_or(false)
-                });
-
-                if !is_relevant {
+                );
+                if !is_modify {
                     continue;
                 }
 
@@ -485,7 +485,10 @@ impl ForgeLanguageServer {
                                 client
                                     .log_message(
                                         lsp_types::MessageType::WARNING,
-                                        format!("ForgeLSP: failed to register updated custom functions from {}: {}", folder_path.display(), e),
+                                        format!(
+                                            "ForgeLSP: failed to register custom functions: {}",
+                                            e
+                                        ),
                                     )
                                     .await;
                             }
@@ -525,6 +528,25 @@ impl LanguageServer for ForgeLanguageServer {
             }
         }
 
+        // Build the base token legend. The Zed-only types are appended
+        // unconditionally here because we don't know `enable_zed_tokens` at
+        // `initialize` time — the client ignores types it doesn't use anyway.
+        // The indices must therefore always match ZED_TOKEN_* constants.
+        let token_types = vec![
+            lsp_types::SemanticTokenType::FUNCTION, // 0 – TOKEN_TYPE_FUNCTION
+            lsp_types::SemanticTokenType::STRING,   // 1 – TOKEN_TYPE_STRING   (Zed-only)
+            lsp_types::SemanticTokenType::NUMBER,   // 2 – TOKEN_TYPE_NUMBER   (Zed-only)
+            lsp_types::SemanticTokenType::new("boolean"), // 3 – TOKEN_TYPE_BOOLEAN (Zed-only)
+            // Bracket rainbow levels: 4..=9 — named "bracket0" … "bracket5"
+            // ForgeZed maps each to a distinct theme colour; other IDEs ignore them.
+            lsp_types::SemanticTokenType::new("bracket0"), // 4
+            lsp_types::SemanticTokenType::new("bracket1"), // 5
+            lsp_types::SemanticTokenType::new("bracket2"), // 6
+            lsp_types::SemanticTokenType::new("bracket3"), // 7
+            lsp_types::SemanticTokenType::new("bracket4"), // 8
+            lsp_types::SemanticTokenType::new("bracket5"), // 9
+        ];
+
         let result = lsp_types::InitializeResult {
             capabilities: lsp_types::ServerCapabilities {
                 text_document_sync: Some(lsp_types::TextDocumentSyncCapability::Kind(
@@ -549,7 +571,7 @@ impl LanguageServer for ForgeLanguageServer {
                     lsp_types::SemanticTokensServerCapabilities::SemanticTokensOptions(
                         lsp_types::SemanticTokensOptions {
                             legend: lsp_types::SemanticTokensLegend {
-                                token_types: vec![lsp_types::SemanticTokenType::FUNCTION],
+                                token_types,
                                 token_modifiers: vec![],
                             },
                             full: Some(lsp_types::SemanticTokensFullOptions::Bool(true)),
@@ -660,6 +682,20 @@ impl LanguageServer for ForgeLanguageServer {
         }
 
         self.refresh_all_documents().await;
+
+        // ── Fix: Zed does not automatically pull semantic tokens on file open.
+        // After `initialized` completes (config loaded, metadata ready, all
+        // documents parsed), send a workspace/semanticTokens/refresh request so
+        // Zed re-requests tokens for every open editor without the user needing
+        // to press a key first.
+        if let Err(e) = self.client.semantic_tokens_refresh().await {
+            self.client
+                .log_message(
+                    lsp_types::MessageType::WARNING,
+                    format!("ForgeLSP: semantic_tokens_refresh failed: {}", e),
+                )
+                .await;
+        }
     }
 
     async fn shutdown(&self) -> Result<()> {
@@ -892,6 +928,10 @@ impl LanguageServer for ForgeLanguageServer {
         }))
     }
 
+    // ========================================================================
+    // Semantic tokens
+    // ========================================================================
+
     async fn semantic_tokens_full(
         &self,
         params: lsp_types::SemanticTokensParams,
@@ -914,6 +954,15 @@ impl LanguageServer for ForgeLanguageServer {
             }
         };
 
+        // Check whether the Zed-specific tokens should be emitted.
+        let enable_zed_tokens = self
+            .config
+            .read()
+            .await
+            .as_ref()
+            .map(|c| c.enable_zed_tokens)
+            .unwrap_or(false);
+
         let cache = self.parse_cache.read().await;
         let ast = match cache.get(uri) {
             Some(cached) => &cached.ast,
@@ -929,7 +978,15 @@ impl LanguageServer for ForgeLanguageServer {
         };
 
         let mut tokens = Vec::new();
+
+        // Always collect function-call tokens (all IDEs).
         collect_semantic_tokens(ast, &text, &mut tokens);
+
+        // Zed-only: strings, numbers, booleans, and rainbow brackets.
+        if enable_zed_tokens {
+            collect_literal_tokens(&text, &mut tokens);
+            collect_bracket_tokens(&text, &mut tokens);
+        }
 
         tokens.sort_by(|a, b| {
             if a.line != b.line {
@@ -1712,7 +1769,13 @@ struct RawSemanticToken {
     modifier_mask: u32,
 }
 
+// Token type indices — must match the legend order declared in `initialize`.
 const TOKEN_TYPE_FUNCTION: u32 = 0;
+const TOKEN_TYPE_STRING: u32 = 1; // Zed-only
+const TOKEN_TYPE_NUMBER: u32 = 2; // Zed-only
+const TOKEN_TYPE_BOOLEAN: u32 = 3; // Zed-only
+const RAINBOW_BRACKET_BASE: u32 = 4; // indices 4–9 are bracket0–bracket5 (Zed-only)
+const RAINBOW_LEVELS: u32 = 6;
 
 fn collect_semantic_tokens(node: &AstNode, text: &str, tokens: &mut Vec<RawSemanticToken>) {
     match node {
@@ -1751,6 +1814,178 @@ fn collect_semantic_tokens(node: &AstNode, text: &str, tokens: &mut Vec<RawSeman
         _ => {}
     }
 }
+
+// ─── Zed-only: literal tokens (strings, numbers, booleans) ────────────────
+//
+// These are derived directly from the raw source text rather than the AST so
+// that they work regardless of which AST node variants forge_kit exposes.
+// The scanner is a simple single-pass byte walker that is safe and fast.
+
+fn collect_literal_tokens(text: &str, tokens: &mut Vec<RawSemanticToken>) {
+    let bytes = text.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+
+    while i < len {
+        // ── Quoted strings: "…" and '…' with backslash-escape support ──────
+        if bytes[i] == b'"' || bytes[i] == b'\'' {
+            let quote = bytes[i];
+            let start = i;
+            i += 1;
+            while i < len {
+                if bytes[i] == b'\\' {
+                    i += 2; // skip escaped char
+                    continue;
+                }
+                if bytes[i] == quote {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            // Emit a STRING token spanning the entire quoted literal.
+            push_span_token(text, start, i, TOKEN_TYPE_STRING, tokens);
+            continue;
+        }
+
+        // ── Numbers: integer or float, optional leading minus ────────────
+        // Only emit when the minus (if present) is not preceded by an
+        // alphanumeric/underscore character (i.e. it is not a subtraction).
+        if bytes[i].is_ascii_digit()
+            || (bytes[i] == b'-'
+                && i + 1 < len
+                && bytes[i + 1].is_ascii_digit()
+                && (i == 0 || !bytes[i - 1].is_ascii_alphanumeric() && bytes[i - 1] != b'_'))
+        {
+            let start = i;
+            if bytes[i] == b'-' {
+                i += 1;
+            }
+            while i < len && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+            // Optional decimal part.
+            if i < len && bytes[i] == b'.' && i + 1 < len && bytes[i + 1].is_ascii_digit() {
+                i += 1;
+                while i < len && bytes[i].is_ascii_digit() {
+                    i += 1;
+                }
+            }
+            push_span_token(text, start, i, TOKEN_TYPE_NUMBER, tokens);
+            continue;
+        }
+
+        // ── Booleans: `true` and `false` as whole words ──────────────────
+        if i + 4 <= len && &bytes[i..i + 4] == b"true" {
+            let after = i + 4;
+            let boundary =
+                after >= len || (!bytes[after].is_ascii_alphanumeric() && bytes[after] != b'_');
+            let before_ok =
+                i == 0 || (!bytes[i - 1].is_ascii_alphanumeric() && bytes[i - 1] != b'_');
+            if boundary && before_ok {
+                push_span_token(text, i, after, TOKEN_TYPE_BOOLEAN, tokens);
+                i = after;
+                continue;
+            }
+        }
+        if i + 5 <= len && &bytes[i..i + 5] == b"false" {
+            let after = i + 5;
+            let boundary =
+                after >= len || (!bytes[after].is_ascii_alphanumeric() && bytes[after] != b'_');
+            let before_ok =
+                i == 0 || (!bytes[i - 1].is_ascii_alphanumeric() && bytes[i - 1] != b'_');
+            if boundary && before_ok {
+                push_span_token(text, i, after, TOKEN_TYPE_BOOLEAN, tokens);
+                i = after;
+                continue;
+            }
+        }
+
+        i += 1;
+    }
+}
+
+// ─── Zed-only: rainbow bracket tokens ─────────────────────────────────────
+//
+// Walk through the source and assign each `[` / `]` a colour index that
+// cycles with nesting depth, mod RAINBOW_LEVELS.
+
+fn collect_bracket_tokens(text: &str, tokens: &mut Vec<RawSemanticToken>) {
+    let bytes = text.as_bytes();
+    let len = bytes.len();
+    let mut depth: u32 = 0;
+    let mut i = 0;
+
+    while i < len {
+        // Skip over string literals so brackets inside strings are ignored.
+        if bytes[i] == b'"' || bytes[i] == b'\'' {
+            let quote = bytes[i];
+            i += 1;
+            while i < len {
+                if bytes[i] == b'\\' {
+                    i += 2;
+                    continue;
+                }
+                if bytes[i] == quote {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+
+        if bytes[i] == b'[' {
+            let color = depth % RAINBOW_LEVELS;
+            push_span_token(text, i, i + 1, RAINBOW_BRACKET_BASE + color, tokens);
+            depth = depth.saturating_add(1);
+            i += 1;
+            continue;
+        }
+
+        if bytes[i] == b']' {
+            depth = depth.saturating_sub(1);
+            let color = depth % RAINBOW_LEVELS;
+            push_span_token(text, i, i + 1, RAINBOW_BRACKET_BASE + color, tokens);
+            i += 1;
+            continue;
+        }
+
+        i += 1;
+    }
+}
+
+/// Convert a byte-range `[start, end)` in `text` into a `RawSemanticToken`
+/// and push it onto `tokens`.  Spans that cross a newline are silently
+/// truncated to the end of the first line (LSP tokens must be single-line).
+fn push_span_token(
+    text: &str,
+    start: usize,
+    end: usize,
+    token_type: u32,
+    tokens: &mut Vec<RawSemanticToken>,
+) {
+    let pos = byte_offset_to_position(text, start);
+    // Clamp length to the end of the current line.
+    let newline_offset = text[start..end.min(text.len())]
+        .find('\n')
+        .unwrap_or(end - start);
+    let length = newline_offset as u32;
+    if length == 0 {
+        return;
+    }
+    tokens.push(RawSemanticToken {
+        line: pos.line,
+        start: pos.character,
+        length,
+        token_type,
+        modifier_mask: 0,
+    });
+}
+
+// ============================================================================
+// Custom-color tokens (forge/customColors notification)
+// ============================================================================
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct CustomColorToken {
