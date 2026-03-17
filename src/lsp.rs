@@ -780,6 +780,23 @@ impl LanguageServer for ForgeLanguageServer {
         }
 
         let prefix = extract_dollar_prefix(&text, cursor_offset);
+
+        // If the cursor is not on a $-prefixed token, only proceed when the
+        // client explicitly invoked completion via a trigger character ('$').
+        // This prevents Zed — which calls the completion handler on every
+        // keystroke — from showing the full function list while the user is
+        // typing normal (non-$) text.
+        if prefix.is_empty() {
+            let triggered_by_dollar = params
+                .context
+                .as_ref()
+                .and_then(|ctx| ctx.trigger_character.as_deref())
+                == Some("$");
+            if !triggered_by_dollar {
+                return Ok(None);
+            }
+        }
+
         let search_prefix = format!("${}", prefix);
 
         let functions = self.metadata.get_completions(&search_prefix);
@@ -793,10 +810,18 @@ impl LanguageServer for ForgeLanguageServer {
             functions
         };
 
-        let items: Vec<lsp_types::CompletionItem> = functions
+        let mut items: Vec<lsp_types::CompletionItem> = functions
             .into_iter()
             .map(|func| build_completion_item(&func, &text, cursor_offset))
             .collect();
+
+        // Sort by label length ascending so shorter names surface first.
+        items.sort_by(|a, b| {
+            a.label
+                .len()
+                .cmp(&b.label.len())
+                .then(a.label.cmp(&b.label))
+        });
 
         Ok(Some(lsp_types::CompletionResponse::Array(items)))
     }
@@ -1834,7 +1859,7 @@ fn collect_folding_ranges(node: &AstNode, text: &str, ranges: &mut Vec<lsp_types
                     start_line: start_pos.line,
                     start_character: Some(start_pos.character),
                     end_line: end_pos.line - 1,
-                    end_character: None, // Ignore end character when hiding lines
+                    end_character: None,
                     kind: Some(lsp_types::FoldingRangeKind::Region),
                     ..lsp_types::FoldingRange::default()
                 });
