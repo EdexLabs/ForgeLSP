@@ -118,12 +118,10 @@ impl ForgeLanguageServer {
                     }
 
                     self.client
-                        .send_notification::<CustomColorNotification>(
-                            CustomColorNotification {
-                                uri: uri.clone(),
-                                tokens: color_tokens,
-                            },
-                        )
+                        .send_notification::<CustomColorNotification>(CustomColorNotification {
+                            uri: uri.clone(),
+                            tokens: color_tokens,
+                        })
                         .await;
                 }
             }
@@ -470,31 +468,37 @@ impl ForgeLanguageServer {
 
                 for folder_path in &folders_clone {
                     match metadata.generate_custom_functions_json(folder_path) {
-                        Ok(json) => {
-                            match metadata.add_custom_functions_from_json(&json) {
-                                Ok(count) => {
-                                    client
-                                        .log_message(
-                                            lsp_types::MessageType::INFO,
-                                            format!("ForgeLSP: reloaded {} custom function(s) from {}", count, folder_path.display()),
-                                        )
-                                        .await;
-                                }
-                                Err(e) => {
-                                    client
+                        Ok(json) => match metadata.add_custom_functions_from_json(&json) {
+                            Ok(count) => {
+                                client
+                                    .log_message(
+                                        lsp_types::MessageType::INFO,
+                                        format!(
+                                            "ForgeLSP: reloaded {} custom function(s) from {}",
+                                            count,
+                                            folder_path.display()
+                                        ),
+                                    )
+                                    .await;
+                            }
+                            Err(e) => {
+                                client
                                     .log_message(
                                         lsp_types::MessageType::WARNING,
                                         format!("ForgeLSP: failed to register updated custom functions from {}: {}", folder_path.display(), e),
                                     )
                                     .await;
-                                }
                             }
-                        }
+                        },
                         Err(e) => {
                             client
                                 .log_message(
                                     lsp_types::MessageType::WARNING,
-                                    format!("ForgeLSP: failed to parse custom functions from {}: {}", folder_path.display(), e),
+                                    format!(
+                                        "ForgeLSP: failed to parse custom functions from {}: {}",
+                                        folder_path.display(),
+                                        e
+                                    ),
                                 )
                                 .await;
                         }
@@ -541,24 +545,22 @@ impl LanguageServer for ForgeLanguageServer {
                     retrigger_characters: Some(vec![";".to_string()]),
                     ..lsp_types::SignatureHelpOptions::default()
                 }),
-                semantic_tokens_provider: if self.pending_config.lock().await.as_ref().and_then(|c| c.custom_colors.as_ref()).is_some() {
-                    None
-                } else {
-                    Some(
-                        lsp_types::SemanticTokensServerCapabilities::SemanticTokensOptions(
-                            lsp_types::SemanticTokensOptions {
-                                legend: lsp_types::SemanticTokensLegend {
-                                    token_types: vec![lsp_types::SemanticTokenType::FUNCTION],
-                                    token_modifiers: vec![],
-                                },
-                                full: Some(lsp_types::SemanticTokensFullOptions::Bool(true)),
-                                ..lsp_types::SemanticTokensOptions::default()
+                semantic_tokens_provider: Some(
+                    lsp_types::SemanticTokensServerCapabilities::SemanticTokensOptions(
+                        lsp_types::SemanticTokensOptions {
+                            legend: lsp_types::SemanticTokensLegend {
+                                token_types: vec![lsp_types::SemanticTokenType::FUNCTION],
+                                token_modifiers: vec![],
                             },
-                        ),
-                    )
-                },
+                            full: Some(lsp_types::SemanticTokensFullOptions::Bool(true)),
+                            ..lsp_types::SemanticTokensOptions::default()
+                        },
+                    ),
+                ),
                 definition_provider: Some(lsp_types::OneOf::Left(true)),
-                folding_range_provider: Some(lsp_types::FoldingRangeProviderCapability::Simple(true)),
+                folding_range_provider: Some(lsp_types::FoldingRangeProviderCapability::Simple(
+                    true,
+                )),
                 ..lsp_types::ServerCapabilities::default()
             },
             ..lsp_types::InitializeResult::default()
@@ -814,10 +816,13 @@ impl LanguageServer for ForgeLanguageServer {
             }
         };
 
-        let func_name = match h_info {
-            Some(i) => i.func_name,
+        let (func_name, hover_range) = match h_info {
+            Some(i) => {
+                let range = span_to_range(&text, i.name_span);
+                (i.func_name, Some(range))
+            }
             None => match find_function_name_at_offset(&text, cursor_offset) {
-                Some(name) => name,
+                Some(name) => (name, None),
                 None => return Ok(None),
             },
         };
@@ -834,7 +839,7 @@ impl LanguageServer for ForgeLanguageServer {
                 kind: lsp_types::MarkupKind::Markdown,
                 value: hover_md,
             }),
-            range: None,
+            range: hover_range,
         }))
     }
 
@@ -1355,6 +1360,7 @@ fn first_sentence(s: &str) -> String {
 
 struct HoverInfo {
     func_name: String,
+    name_span: Span,
 }
 
 fn find_hover_info(node: &AstNode, offset: usize, current_depth: usize) -> Option<HoverInfo> {
@@ -1401,6 +1407,7 @@ fn find_hover_info(node: &AstNode, offset: usize, current_depth: usize) -> Optio
 
             Some(HoverInfo {
                 func_name: full_name,
+                name_span: *name_span,
             })
         }
         _ => None,
