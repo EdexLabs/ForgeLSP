@@ -205,91 +205,7 @@ impl ForgeLanguageServer {
     // Custom function loading
     // ========================================================================
 
-    async fn load_custom_functions(&self, config: &ForgeConfig) {
-        if let Some(json_path) = &config.custom_functions_json {
-            let path = PathBuf::from(json_path);
-            match self.metadata.add_custom_functions_from_json_file(&path) {
-                Ok(count) => {
-                    self.client
-                        .log_message(
-                            lsp_types::MessageType::INFO,
-                            format!(
-                                "Loaded {} custom function(s) from JSON: {}",
-                                count,
-                                path.display()
-                            ),
-                        )
-                        .await;
-                }
-                Err(e) => {
-                    self.client
-                        .log_message(
-                            lsp_types::MessageType::WARNING,
-                            format!(
-                                "Failed to load custom-functions JSON at {}: {}",
-                                path.display(),
-                                e
-                            ),
-                        )
-                        .await;
-                }
-            }
-        }
-
-        if let Some(cf_path) = &config.custom_functions_path {
-            for folder_path in cf_path.to_vec() {
-                let folder = PathBuf::from(&folder_path);
-                if folder.exists() && folder.is_dir() {
-                    match self.metadata.generate_custom_functions_json(&folder) {
-                        Ok(json) => match self.metadata.add_custom_functions_from_json(&json) {
-                            Ok(count) => {
-                                self.client
-                                    .log_message(
-                                        lsp_types::MessageType::INFO,
-                                        format!(
-                                            "Loaded {} custom function(s) from folder: {}",
-                                            count,
-                                            folder.display()
-                                        ),
-                                    )
-                                    .await;
-                            }
-                            Err(e) => {
-                                self.client
-                                    .log_message(
-                                        lsp_types::MessageType::WARNING,
-                                        format!("Failed to register custom functions: {}", e),
-                                    )
-                                    .await;
-                            }
-                        },
-                        Err(e) => {
-                            self.client
-                                .log_message(
-                                    lsp_types::MessageType::WARNING,
-                                    format!(
-                                        "Failed to parse custom functions from {}: {}",
-                                        folder.display(),
-                                        e
-                                    ),
-                                )
-                                .await;
-                        }
-                    }
-                } else {
-                    self.client
-                        .log_message(
-                            lsp_types::MessageType::WARNING,
-                            format!(
-                                "custom_functions_path is not a directory: {}",
-                                folder.display()
-                            ),
-                        )
-                        .await;
-                }
-            }
-        }
-    }
+    // No longer a method here, moved to a standalone function below
 
     // ========================================================================
     // Metadata disk cache
@@ -387,6 +303,7 @@ impl ForgeLanguageServer {
 
         let metadata = Arc::clone(&self.metadata);
         let client = self.client.clone();
+        let config_json = self.config.read().await.as_ref().and_then(|c| c.custom_functions_json.clone());
         let folders_clone = folders.clone();
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<notify::Result<NotifyEvent>>(32);
@@ -466,44 +383,12 @@ impl ForgeLanguageServer {
                     continue;
                 }
 
-                for folder_path in &folders_clone {
-                    match metadata.generate_custom_functions_json(folder_path) {
-                        Ok(json) => match metadata.add_custom_functions_from_json(&json) {
-                            Ok(count) => {
-                                client
-                                    .log_message(
-                                        lsp_types::MessageType::INFO,
-                                        format!(
-                                            "ForgeLSP: reloaded {} custom function(s) from {}",
-                                            count,
-                                            folder_path.display()
-                                        ),
-                                    )
-                                    .await;
-                            }
-                            Err(e) => {
-                                client
-                                    .log_message(
-                                        lsp_types::MessageType::WARNING,
-                                        format!("ForgeLSP: failed to register updated custom functions from {}: {}", folder_path.display(), e),
-                                    )
-                                    .await;
-                            }
-                        },
-                        Err(e) => {
-                            client
-                                .log_message(
-                                    lsp_types::MessageType::WARNING,
-                                    format!(
-                                        "ForgeLSP: failed to parse custom functions from {}: {}",
-                                        folder_path.display(),
-                                        e
-                                    ),
-                                )
-                                .await;
-                        }
-                    }
-                }
+                perform_load_custom_functions(
+                    metadata.clone(),
+                    client.clone(),
+                    config_json.clone(),
+                    Some(folders_clone.iter().map(|p| p.to_string_lossy().to_string()).collect()),
+                ).await;
             }
         });
     }
@@ -608,7 +493,12 @@ impl LanguageServer for ForgeLanguageServer {
             self.scan_workspace().await;
         }
 
-        self.load_custom_functions(&config).await;
+        perform_load_custom_functions(
+            self.metadata.clone(),
+            self.client.clone(),
+            config.custom_functions_json.clone(),
+            config.custom_functions_path.as_ref().map(|p| p.to_vec()),
+        ).await;
 
         if let Some(cf_path) = &config.custom_functions_path {
             let mut folders = Vec::new();
@@ -781,11 +671,6 @@ impl LanguageServer for ForgeLanguageServer {
 
         let prefix = extract_dollar_prefix(&text, cursor_offset);
 
-        // If the cursor is not on a $-prefixed token, only proceed when the
-        // client explicitly invoked completion via a trigger character ('$').
-        // This prevents Zed — which calls the completion handler on every
-        // keystroke — from showing the full function list while the user is
-        // typing normal (non-$) text.
         if prefix.is_empty() {
             let triggered_by_dollar = params
                 .context
@@ -1874,5 +1759,110 @@ fn collect_folding_ranges(node: &AstNode, text: &str, ranges: &mut Vec<lsp_types
             }
         }
         _ => {}
+    }
+}
+// ============================================================================
+// Custom function loading (standalone functions to avoid &self lifetime issues)
+// ============================================================================
+
+async fn perform_load_custom_functions(
+    metadata: Arc<MetadataManager>,
+    client: Client,
+    custom_functions_json: Option<String>,
+    custom_functions_path: Option<Vec<String>>,
+) {
+    let mut all_functions: Vec<serde_json::Value> = Vec::new();
+
+    if let Some(json_path) = &custom_functions_json {
+        let path = PathBuf::from(json_path);
+        match std::fs::read_to_string(&path) {
+            Ok(json_str) => match serde_json::from_str::<Vec<serde_json::Value>>(&json_str) {
+                Ok(mut functions) => {
+                    all_functions.append(&mut functions);
+                    let _ = client.log_message(
+                        lsp_types::MessageType::INFO,
+                        format!("Loaded {} custom function(s) from JSON: {}", functions.len(), path.display())
+                    ).await;
+                }
+                Err(e) => {
+                    let _ = client.log_message(
+                        lsp_types::MessageType::WARNING,
+                        format!("Failed to parse custom-functions JSON at {}: {}", path.display(), e)
+                    ).await;
+                }
+            },
+            Err(e) => {
+                let _ = client.log_message(
+                    lsp_types::MessageType::WARNING,
+                    format!("Failed to read custom-functions JSON file at {}: {}", path.display(), e)
+                ).await;
+            }
+        }
+    }
+
+    if let Some(paths) = &custom_functions_path {
+        for folder_path in paths {
+            let folder = PathBuf::from(&folder_path);
+            if folder.exists() && folder.is_dir() {
+                match metadata.generate_custom_functions_json(&folder) {
+                    Ok(json_str) => match serde_json::from_str::<Vec<serde_json::Value>>(&json_str) {
+                        Ok(mut functions) => {
+                            let count = functions.len();
+                            all_functions.append(&mut functions);
+                            let _ = client.log_message(
+                                lsp_types::MessageType::INFO,
+                                format!("Loaded {} custom function(s) from folder: {}", count, folder.display())
+                            ).await;
+                        }
+                        Err(e) => {
+                            let _ = client.log_message(
+                                lsp_types::MessageType::WARNING,
+                                format!("Failed to parse generated JSON from {}: {}", folder.display(), e)
+                            ).await;
+                        }
+                    },
+                    Err(e) => {
+                        let _ = client.log_message(
+                            lsp_types::MessageType::WARNING,
+                            format!("Failed to generate custom functions from {}: {}", folder.display(), e)
+                        ).await;
+                    }
+                }
+            } else {
+                let _ = client.log_message(
+                    lsp_types::MessageType::WARNING,
+                    format!("custom_functions_path is not a directory: {}", folder.display())
+                ).await;
+            }
+        }
+    }
+
+    if !all_functions.is_empty() {
+        match serde_json::to_string(&all_functions) {
+            Ok(final_json) => {
+                match metadata.add_custom_functions_from_json(&final_json) {
+                    Ok(count) => {
+                        let _ = client.log_message(
+                            lsp_types::MessageType::INFO,
+                            format!("Registered {} total custom function(s)", count)
+                        ).await;
+                    }
+                    Err(e) => {
+                        let _ = client.log_message(
+                            lsp_types::MessageType::WARNING,
+                            format!("Failed to register custom functions: {}", e)
+                        ).await;
+                    }
+                }
+            }
+            Err(e) => {
+                let _ = client.log_message(
+                    lsp_types::MessageType::WARNING,
+                    format!("Failed to serialize aggregated custom functions: {}", e)
+                ).await;
+            }
+        }
+    } else {
+        metadata.remove_custom_functions();
     }
 }
