@@ -49,6 +49,7 @@ struct ForgeConfig {
     custom_functions_json: Option<String>,
     cache_path: Option<String>,
     custom_colors: Option<Vec<String>>,
+    constant_custom_colors: Option<bool>,
 }
 
 // ============================================================================
@@ -104,7 +105,14 @@ impl ForgeLanguageServer {
             if let Some(colors) = &cfg.custom_colors {
                 if !colors.is_empty() {
                     let mut color_tokens = Vec::new();
-                    collect_custom_color_tokens(&ast, &text, &mut color_tokens, colors.len());
+                    let constant_colors = cfg.constant_custom_colors.unwrap_or(false);
+                    collect_custom_color_tokens(
+                        &ast,
+                        &text,
+                        &mut color_tokens,
+                        colors.len(),
+                        constant_colors,
+                    );
 
                     #[derive(serde::Serialize, serde::Deserialize)]
                     struct CustomColorNotification {
@@ -1700,9 +1708,10 @@ fn collect_custom_color_tokens(
     text: &str,
     tokens: &mut Vec<CustomColorToken>,
     color_count: usize,
+    constant_colors: bool,
 ) {
     let mut state = 0;
-    collect_custom_color_tokens_inner(node, text, tokens, color_count, &mut state);
+    collect_custom_color_tokens_inner(node, text, tokens, color_count, &mut state, constant_colors);
 }
 
 fn collect_custom_color_tokens_inner(
@@ -1711,11 +1720,19 @@ fn collect_custom_color_tokens_inner(
     tokens: &mut Vec<CustomColorToken>,
     color_count: usize,
     state: &mut usize,
+    constant_colors: bool,
 ) {
     match node {
         AstNode::Program { body, .. } => {
             for child in body {
-                collect_custom_color_tokens_inner(child, text, tokens, color_count, state);
+                collect_custom_color_tokens_inner(
+                    child,
+                    text,
+                    tokens,
+                    color_count,
+                    state,
+                    constant_colors,
+                );
             }
         }
         AstNode::FunctionCall {
@@ -1726,17 +1743,31 @@ fn collect_custom_color_tokens_inner(
         } => {
             if name != "c" && name != "$c" {
                 let range = span_to_range(text, *name_span);
-                tokens.push(CustomColorToken {
-                    range,
-                    color_index: *state % color_count,
-                });
-                *state += 1;
+                let color_index = if constant_colors {
+                    use std::collections::hash_map::DefaultHasher;
+                    use std::hash::{Hash, Hasher};
+                    let mut hasher = DefaultHasher::new();
+                    name.hash(&mut hasher);
+                    (hasher.finish() as usize) % color_count
+                } else {
+                    let idx = *state % color_count;
+                    *state += 1;
+                    idx
+                };
+                tokens.push(CustomColorToken { range, color_index });
             }
 
             if let Some(args) = args {
                 for arg in args {
                     for part in &arg.parts {
-                        collect_custom_color_tokens_inner(part, text, tokens, color_count, state);
+                        collect_custom_color_tokens_inner(
+                            part,
+                            text,
+                            tokens,
+                            color_count,
+                            state,
+                            constant_colors,
+                        );
                     }
                 }
             }
