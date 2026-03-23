@@ -303,7 +303,12 @@ impl ForgeLanguageServer {
 
         let metadata = Arc::clone(&self.metadata);
         let client = self.client.clone();
-        let config_json = self.config.read().await.as_ref().and_then(|c| c.custom_functions_json.clone());
+        let config_json = self
+            .config
+            .read()
+            .await
+            .as_ref()
+            .and_then(|c| c.custom_functions_json.clone());
         let folders_clone = folders.clone();
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<notify::Result<NotifyEvent>>(32);
@@ -387,8 +392,14 @@ impl ForgeLanguageServer {
                     metadata.clone(),
                     client.clone(),
                     config_json.clone(),
-                    Some(folders_clone.iter().map(|p| p.to_string_lossy().to_string()).collect()),
-                ).await;
+                    Some(
+                        folders_clone
+                            .iter()
+                            .map(|p| p.to_string_lossy().to_string())
+                            .collect(),
+                    ),
+                )
+                .await;
             }
         });
     }
@@ -498,7 +509,8 @@ impl LanguageServer for ForgeLanguageServer {
             self.client.clone(),
             config.custom_functions_json.clone(),
             config.custom_functions_path.as_ref().map(|p| p.to_vec()),
-        ).await;
+        )
+        .await;
 
         if let Some(cf_path) = &config.custom_functions_path {
             let mut folders = Vec::new();
@@ -1015,7 +1027,16 @@ fn byte_offset_to_position(text: &str, byte_offset: usize) -> lsp_types::Positio
         }
     }
 
-    let col = prefix[last_line_start..].chars().count() as u32;
+    // LSP positions use UTF-16 code units, not Unicode scalar values.
+    // Characters outside the Basic Multilingual Plane (e.g. emoji like 🔴,
+    // U+1F534) encode as 1 Rust `char` but 2 UTF-16 code units.  Using
+    // `chars().count()` therefore under-counts the column for any line that
+    // contains such characters, causing semantic-token highlights, diagnostics,
+    // and completion ranges to be shifted left by one position per non-BMP char.
+    let col: u32 = prefix[last_line_start..]
+        .chars()
+        .map(|c| c.len_utf16() as u32)
+        .sum();
     lsp_types::Position {
         line,
         character: col,
@@ -1779,23 +1800,41 @@ async fn perform_load_custom_functions(
             Ok(json_str) => match serde_json::from_str::<Vec<serde_json::Value>>(&json_str) {
                 Ok(mut functions) => {
                     all_functions.append(&mut functions);
-                    let _ = client.log_message(
-                        lsp_types::MessageType::INFO,
-                        format!("Loaded {} custom function(s) from JSON: {}", functions.len(), path.display())
-                    ).await;
+                    let _ = client
+                        .log_message(
+                            lsp_types::MessageType::INFO,
+                            format!(
+                                "Loaded {} custom function(s) from JSON: {}",
+                                functions.len(),
+                                path.display()
+                            ),
+                        )
+                        .await;
                 }
                 Err(e) => {
-                    let _ = client.log_message(
-                        lsp_types::MessageType::WARNING,
-                        format!("Failed to parse custom-functions JSON at {}: {}", path.display(), e)
-                    ).await;
+                    let _ = client
+                        .log_message(
+                            lsp_types::MessageType::WARNING,
+                            format!(
+                                "Failed to parse custom-functions JSON at {}: {}",
+                                path.display(),
+                                e
+                            ),
+                        )
+                        .await;
                 }
             },
             Err(e) => {
-                let _ = client.log_message(
-                    lsp_types::MessageType::WARNING,
-                    format!("Failed to read custom-functions JSON file at {}: {}", path.display(), e)
-                ).await;
+                let _ = client
+                    .log_message(
+                        lsp_types::MessageType::WARNING,
+                        format!(
+                            "Failed to read custom-functions JSON file at {}: {}",
+                            path.display(),
+                            e
+                        ),
+                    )
+                    .await;
             }
         }
     }
@@ -1805,61 +1844,89 @@ async fn perform_load_custom_functions(
             let folder = PathBuf::from(&folder_path);
             if folder.exists() && folder.is_dir() {
                 match metadata.generate_custom_functions_json(&folder) {
-                    Ok(json_str) => match serde_json::from_str::<Vec<serde_json::Value>>(&json_str) {
+                    Ok(json_str) => match serde_json::from_str::<Vec<serde_json::Value>>(&json_str)
+                    {
                         Ok(mut functions) => {
                             let count = functions.len();
                             all_functions.append(&mut functions);
-                            let _ = client.log_message(
-                                lsp_types::MessageType::INFO,
-                                format!("Loaded {} custom function(s) from folder: {}", count, folder.display())
-                            ).await;
+                            let _ = client
+                                .log_message(
+                                    lsp_types::MessageType::INFO,
+                                    format!(
+                                        "Loaded {} custom function(s) from folder: {}",
+                                        count,
+                                        folder.display()
+                                    ),
+                                )
+                                .await;
                         }
                         Err(e) => {
-                            let _ = client.log_message(
-                                lsp_types::MessageType::WARNING,
-                                format!("Failed to parse generated JSON from {}: {}", folder.display(), e)
-                            ).await;
+                            let _ = client
+                                .log_message(
+                                    lsp_types::MessageType::WARNING,
+                                    format!(
+                                        "Failed to parse generated JSON from {}: {}",
+                                        folder.display(),
+                                        e
+                                    ),
+                                )
+                                .await;
                         }
                     },
                     Err(e) => {
-                        let _ = client.log_message(
-                            lsp_types::MessageType::WARNING,
-                            format!("Failed to generate custom functions from {}: {}", folder.display(), e)
-                        ).await;
+                        let _ = client
+                            .log_message(
+                                lsp_types::MessageType::WARNING,
+                                format!(
+                                    "Failed to generate custom functions from {}: {}",
+                                    folder.display(),
+                                    e
+                                ),
+                            )
+                            .await;
                     }
                 }
             } else {
-                let _ = client.log_message(
-                    lsp_types::MessageType::WARNING,
-                    format!("custom_functions_path is not a directory: {}", folder.display())
-                ).await;
+                let _ = client
+                    .log_message(
+                        lsp_types::MessageType::WARNING,
+                        format!(
+                            "custom_functions_path is not a directory: {}",
+                            folder.display()
+                        ),
+                    )
+                    .await;
             }
         }
     }
 
     if !all_functions.is_empty() {
         match serde_json::to_string(&all_functions) {
-            Ok(final_json) => {
-                match metadata.add_custom_functions_from_json(&final_json) {
-                    Ok(count) => {
-                        let _ = client.log_message(
+            Ok(final_json) => match metadata.add_custom_functions_from_json(&final_json) {
+                Ok(count) => {
+                    let _ = client
+                        .log_message(
                             lsp_types::MessageType::INFO,
-                            format!("Registered {} total custom function(s)", count)
-                        ).await;
-                    }
-                    Err(e) => {
-                        let _ = client.log_message(
-                            lsp_types::MessageType::WARNING,
-                            format!("Failed to register custom functions: {}", e)
-                        ).await;
-                    }
+                            format!("Registered {} total custom function(s)", count),
+                        )
+                        .await;
                 }
-            }
+                Err(e) => {
+                    let _ = client
+                        .log_message(
+                            lsp_types::MessageType::WARNING,
+                            format!("Failed to register custom functions: {}", e),
+                        )
+                        .await;
+                }
+            },
             Err(e) => {
-                let _ = client.log_message(
-                    lsp_types::MessageType::WARNING,
-                    format!("Failed to serialize aggregated custom functions: {}", e)
-                ).await;
+                let _ = client
+                    .log_message(
+                        lsp_types::MessageType::WARNING,
+                        format!("Failed to serialize aggregated custom functions: {}", e),
+                    )
+                    .await;
             }
         }
     } else {
