@@ -463,7 +463,7 @@ impl LanguageServer for ForgeLanguageServer {
                         lsp_types::SemanticTokensServerCapabilities::SemanticTokensOptions(
                             lsp_types::SemanticTokensOptions {
                                 legend: lsp_types::SemanticTokensLegend {
-                                    token_types: vec![lsp_types::SemanticTokenType::FUNCTION],
+                                    token_types: vec![lsp_types::SemanticTokenType::FUNCTION, lsp_types::SemanticTokenType::COMMENT],
                                     token_modifiers: vec![],
                                 },
                                 full: Some(lsp_types::SemanticTokensFullOptions::Bool(true)),
@@ -1466,6 +1466,13 @@ pub fn build_hover_markdown(func: &Function) -> String {
         md.push_str(&format!("\n*{}*\n", ext));
     }
 
+    if let Some(output) = &func.output {
+        let out_str = format_arg_type(output);
+        if !out_str.is_empty() {
+            md.push_str(&format!("\n**Returns:** `{}`\n", out_str));
+        }
+    }
+
     md.push_str("\n---\n");
 
     if !func.description.is_empty() {
@@ -1658,6 +1665,7 @@ struct RawSemanticToken {
 }
 
 const TOKEN_TYPE_FUNCTION: u32 = 0;
+const TOKEN_TYPE_COMMENT: u32 = 1;
 
 fn collect_semantic_tokens(node: &AstNode, text: &str, tokens: &mut Vec<RawSemanticToken>) {
     match node {
@@ -1691,6 +1699,26 @@ fn collect_semantic_tokens(node: &AstNode, text: &str, tokens: &mut Vec<RawSeman
                         collect_semantic_tokens(part, text, tokens);
                     }
                 }
+            }
+        }
+        AstNode::Escaped { span, .. } => {
+            let content_str = &text[span.start..span.end];
+            let mut current_offset = span.start;
+            
+            for line_content in content_str.split('\n') {
+                if !line_content.is_empty() {
+                    let pos = byte_offset_to_position(text, current_offset);
+                    
+                    let length = line_content.len() as u32;
+                    tokens.push(RawSemanticToken {
+                        line: pos.line,
+                        start: pos.character,
+                        length,
+                        token_type: TOKEN_TYPE_COMMENT,
+                        modifier_mask: 0,
+                    });
+                }
+                current_offset += line_content.len() + 1;
             }
         }
         _ => {}
