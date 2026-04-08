@@ -463,7 +463,10 @@ impl LanguageServer for ForgeLanguageServer {
                         lsp_types::SemanticTokensServerCapabilities::SemanticTokensOptions(
                             lsp_types::SemanticTokensOptions {
                                 legend: lsp_types::SemanticTokensLegend {
-                                    token_types: vec![lsp_types::SemanticTokenType::FUNCTION, lsp_types::SemanticTokenType::COMMENT],
+                                    token_types: vec![
+                                        lsp_types::SemanticTokenType::FUNCTION,
+                                        lsp_types::SemanticTokenType::COMMENT,
+                                    ],
                                     token_modifiers: vec![],
                                 },
                                 full: Some(lsp_types::SemanticTokensFullOptions::Bool(true)),
@@ -690,17 +693,6 @@ impl LanguageServer for ForgeLanguageServer {
         }
 
         let prefix = extract_dollar_prefix(&text, cursor_offset);
-
-        if prefix.is_empty() {
-            let triggered_by_dollar = params
-                .context
-                .as_ref()
-                .and_then(|ctx| ctx.trigger_character.as_deref())
-                == Some("$");
-            if !triggered_by_dollar {
-                return Ok(None);
-            }
-        }
 
         let search_prefix = format!("${}", prefix);
 
@@ -1704,11 +1696,11 @@ fn collect_semantic_tokens(node: &AstNode, text: &str, tokens: &mut Vec<RawSeman
         AstNode::Escaped { span, .. } => {
             let content_str = &text[span.start..span.end];
             let mut current_offset = span.start;
-            
+
             for line_content in content_str.split('\n') {
                 if !line_content.is_empty() {
                     let pos = byte_offset_to_position(text, current_offset);
-                    
+
                     let length = line_content.len() as u32;
                     tokens.push(RawSemanticToken {
                         line: pos.line,
