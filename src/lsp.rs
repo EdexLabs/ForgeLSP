@@ -479,6 +479,10 @@ impl LanguageServer for ForgeLanguageServer {
                 folding_range_provider: Some(lsp_types::FoldingRangeProviderCapability::Simple(
                     true,
                 )),
+                execute_command_provider: Some(lsp_types::ExecuteCommandOptions {
+                    commands: vec!["forge.getInlineCompletions".to_string()],
+                    ..lsp_types::ExecuteCommandOptions::default()
+                }),
                 ..lsp_types::ServerCapabilities::default()
             },
             ..lsp_types::InitializeResult::default()
@@ -823,6 +827,76 @@ impl LanguageServer for ForgeLanguageServer {
             active_signature: Some(0),
             active_parameter: Some(active_param),
         }))
+    }
+
+    async fn execute_command(
+        &self,
+        params: lsp_types::ExecuteCommandParams,
+    ) -> Result<Option<serde_json::Value>> {
+        if params.command == "forge.getInlineCompletions" {
+            let args = params.arguments;
+            if args.len() < 3 {
+                return Ok(None);
+            }
+
+            // Expected arguments from VS Code: [ uri, line, character ]
+            let uri_str = args.get(0).and_then(|v| v.as_str());
+            let line = args.get(1).and_then(|v| v.as_u64());
+            let character = args.get(2).and_then(|v| v.as_u64());
+
+            let (uri_str, line, character) = match (uri_str, line, character) {
+                (Some(u), Some(l), Some(c)) => (u, l as u32, c as u32),
+                _ => return Ok(None),
+            };
+
+            let uri = match lsp_types::Url::parse(uri_str) {
+                Ok(u) => u,
+                Err(_) => return Ok(None),
+            };
+
+            let text = {
+                let docs = self.documents.read().await;
+                match docs.get(&uri) {
+                    Some(t) => t.clone(),
+                    None => return Ok(None),
+                }
+            };
+
+            let pos = lsp_types::Position { line, character };
+            let cursor_offset = position_to_byte_offset(&text, pos);
+
+            let mut completions = Vec::new();
+
+            // 1. Suggest [] for functions that accept brackets
+            if let Some(prefix) = extract_dollar_prefix(&text, cursor_offset) {
+                let func_name = format!("${}", prefix);
+                if let Some(func) = self.metadata.get_exact(&func_name) {
+                    if func.brackets == Some(true) {
+                        let followed_by_bracket =
+                            text[cursor_offset..].trim_start().starts_with('[');
+
+                        if !followed_by_bracket {
+                            completions.push("[]".to_string());
+                        }
+                    }
+                }
+            }
+
+            // 2. Suggest ] for missing closing brackets
+            if completions.is_empty() {
+                if find_arg_context(&text, cursor_offset).is_some() {
+                    if is_bracket_unclosed(&text, cursor_offset) {
+                        completions.push("]".to_string());
+                    }
+                }
+            }
+
+            return Ok(Some(
+                serde_json::to_value(completions).unwrap_or(serde_json::Value::Null),
+            ));
+        }
+
+        Ok(None)
     }
 
     async fn semantic_tokens_full(
@@ -1189,6 +1263,61 @@ fn find_arg_context(text: &str, cursor: usize) -> Option<ArgContext> {
         func_name,
         arg_index,
     })
+}
+
+fn is_bracket_unclosed(text: &str, cursor: usize) -> bool {
+    let bytes = text.as_bytes();
+    let mut backward_depth = 0i32;
+    let mut i = cursor;
+
+    // 1. Find nearest unclosed opening bracket before cursor
+    let mut opening_bracket_pos = None;
+    while i > 0 {
+        i -= 1;
+        match bytes[i] {
+            b'[' => {
+                if backward_depth == 0 {
+                    opening_bracket_pos = Some(i);
+                    break;
+                }
+                backward_depth -= 1;
+            }
+            b']' => {
+                backward_depth += 1;
+            }
+            b'\n' => break,
+            _ => {}
+        }
+    }
+
+    let start_pos = match opening_bracket_pos {
+        Some(pos) => pos,
+        None => return false,
+    };
+
+    // 2. From that opening bracket, scan forward to the end of the line
+    // to see if it is EVER closed.
+    let mut forward_depth = 0i32;
+    let mut j = start_pos;
+    while j < bytes.len() {
+        match bytes[j] {
+            b'[' => forward_depth += 1,
+            b']' => {
+                forward_depth -= 1;
+                if forward_depth == 0 {
+                    if j >= cursor {
+                        return false;
+                    }
+                }
+            }
+            b'\n' => break,
+            _ => {}
+        }
+        j += 1;
+    }
+
+    // If we finished the scan and forward_depth > 0, it means it's unclosed.
+    forward_depth > 0
 }
 
 fn count_arg_index(content: &str) -> usize {
