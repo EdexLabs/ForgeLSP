@@ -692,7 +692,10 @@ impl LanguageServer for ForgeLanguageServer {
             // Unknown function or no args — fall through as well.
         }
 
-        let prefix = extract_dollar_prefix(&text, cursor_offset);
+        let prefix = match extract_dollar_prefix(&text, cursor_offset) {
+            Some(p) => p,
+            None => return Ok(None),
+        };
 
         let search_prefix = format!("${}", prefix);
 
@@ -1073,7 +1076,7 @@ fn position_to_byte_offset(text: &str, pos: lsp_types::Position) -> usize {
 // Completion helpers
 // ============================================================================
 
-fn extract_dollar_prefix(text: &str, cursor: usize) -> String {
+fn extract_dollar_prefix(text: &str, cursor: usize) -> Option<String> {
     let bytes = text.as_bytes();
     let cursor = cursor.min(bytes.len());
 
@@ -1089,18 +1092,40 @@ fn extract_dollar_prefix(text: &str, cursor: usize) -> String {
     let id_start = start;
 
     let mut search = id_start;
+    let mut in_bracket = false;
+
     while search > 0 {
         let b = bytes[search - 1];
-        if b == b'$' {
-            return text[id_start..cursor].to_string();
-        } else if b.is_ascii_alphabetic() || b == b'@' || b == b'!' || b == b'#' || b == b'?' {
+
+        if b == b'$' && !in_bracket {
+            return Some(text[id_start..cursor].to_string());
+        }
+
+        if b == b']' {
+            in_bracket = true;
+        } else if b == b'[' {
+            in_bracket = false;
+        }
+
+        // Allowed in prefix: modifiers (!, #, ?), tags (@, []), and whitespace.
+        // Inside brackets, we are more permissive (for tag content).
+        let is_valid = if in_bracket {
+            b != b'\n' && b != b'\r'
+        } else {
+            matches!(
+                b,
+                b'!' | b'#' | b'?' | b'@' | b'[' | b']' | b' ' | b'\t' | b'.' | b'-' | b'_'
+            )
+        };
+
+        if is_valid {
             search -= 1;
         } else {
             break;
         }
     }
 
-    String::new()
+    None
 }
 
 struct ArgContext {
