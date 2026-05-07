@@ -1698,42 +1698,42 @@ pub fn build_hover_markdown_for_completion(func: &Function) -> String {
 }
 
 fn build_usage_line_v2(func: &Function) -> String {
-    let has_args = match &func.args {
-        Some(v) => !v.is_empty(),
-        None => false,
+    let arg_parts = if let Some(vec) = &func.args {
+        if !vec.is_empty() {
+            Some(
+                vec.iter()
+                    .map(|a| {
+                        let mut name_part = a.name.clone();
+                        if a.rest {
+                            name_part = format!("...{}", name_part);
+                        }
+                        if a.rest || !a.required.unwrap_or(false) {
+                            name_part.push('?');
+                        }
+
+                        let ty = format_arg_type(&a.arg_type);
+                        format!("{}: {}", name_part, ty)
+                    })
+                    .collect::<Vec<String>>()
+                    .join("; "),
+            )
+        } else {
+            None
+        }
+    } else {
+        None
     };
-    let show_brackets = func.brackets.unwrap_or(false) || has_args;
 
-    if !show_brackets {
-        return func.name.clone();
-    }
-
-    match &func.args {
-        Some(vec) if !vec.is_empty() => {
-            let arg_parts: Vec<String> = vec
-                .iter()
-                .map(|a| {
-                    let mut name_part = a.name.clone();
-                    if a.rest {
-                        name_part = format!("...{}", name_part);
-                    }
-                    if !a.required.unwrap_or(false) && !a.rest {
-                        name_part.push('?');
-                    }
-
-                    let ty = format_arg_type(&a.arg_type);
-                    format!("{}: {}", name_part, ty)
-                })
-                .collect();
-            format!("{}[{}]", func.name, arg_parts.join("; "))
-        }
-        _ => {
-            if show_brackets {
-                format!("{}[]", func.name)
-            } else {
-                func.name.clone()
-            }
-        }
+    match func.brackets {
+        Some(true) => match arg_parts {
+            Some(args) => format!("{}[{}]", func.name, args),
+            None => format!("{}[]", func.name),
+        },
+        Some(false) => match arg_parts {
+            Some(args) => format!("{}[{}]?", func.name, args),
+            None => format!("{}[]?", func.name),
+        },
+        None => func.name.clone(),
     }
 }
 
@@ -1749,7 +1749,7 @@ fn build_signature_info(func: &Function) -> lsp_types::SignatureInformation {
             if arg.rest {
                 name_part = format!("...{}", name_part);
             }
-            if !arg.required.unwrap_or(false) && !arg.rest {
+            if arg.rest || !arg.required.unwrap_or(false) {
                 name_part.push('?');
             }
 
