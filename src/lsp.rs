@@ -1826,7 +1826,7 @@ fn collect_semantic_tokens(node: &AstNode, text: &str, tokens: &mut Vec<RawSeman
             args,
             ..
         } => {
-            if name != "c" && name != "$c" {
+            if !name.eq_ignore_ascii_case("c") && !name.eq_ignore_ascii_case("$c") {
                 let pos = byte_offset_to_position(text, name_span.start);
                 let length = (name_span.end - name_span.start) as u32;
 
@@ -1847,24 +1847,16 @@ fn collect_semantic_tokens(node: &AstNode, text: &str, tokens: &mut Vec<RawSeman
                 }
             }
         }
-        AstNode::Escaped { span, .. } => {
-            let content_str = &text[span.start..span.end];
-            let mut current_offset = span.start;
-
-            for line_content in content_str.split('\n') {
-                if !line_content.is_empty() {
-                    let pos = byte_offset_to_position(text, current_offset);
-
-                    let length = line_content.len() as u32;
-                    tokens.push(RawSemanticToken {
-                        line: pos.line,
-                        start: pos.character,
-                        length,
-                        token_type: TOKEN_TYPE_COMMENT,
-                        modifier_mask: 0,
-                    });
-                }
-                current_offset += line_content.len() + 1;
+        AstNode::Escaped { name, span, .. } => {
+            if name.eq_ignore_ascii_case("c") || name.eq_ignore_ascii_case("$c") {
+                let pos = byte_offset_to_position(text, span.start);
+                tokens.push(RawSemanticToken {
+                    line: pos.line,
+                    start: pos.character,
+                    length: (span.end - span.start) as u32,
+                    token_type: TOKEN_TYPE_COMMENT,
+                    modifier_mask: 0,
+                });
             }
         }
         _ => {}
@@ -1915,7 +1907,7 @@ fn collect_custom_color_tokens_inner(
             args,
             ..
         } => {
-            if name != "c" && name != "$c" {
+            if !name.eq_ignore_ascii_case("c") && !name.eq_ignore_ascii_case("$c") {
                 let range = span_to_range(text, *name_span);
                 let color_index = if constant_colors {
                     use std::collections::hash_map::DefaultHasher;
@@ -1946,6 +1938,7 @@ fn collect_custom_color_tokens_inner(
                 }
             }
         }
+        AstNode::Escaped { .. } => {}
         _ => {}
     }
 }
