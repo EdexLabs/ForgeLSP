@@ -48,8 +48,66 @@ struct ForgeConfig {
     custom_functions_path: Option<CustomFunctionsPath>,
     custom_functions_json: Option<String>,
     cache_path: Option<String>,
+    // ── Function cycling colors (existing) ─────────────────────────────────
     custom_colors: Option<Vec<String>>,
     constant_custom_colors: Option<bool>,
+    // ── Per-token-type colors (new, all optional single hex strings) ────────
+    custom_color_text: Option<String>,
+    custom_color_time: Option<String>,
+    custom_color_numbers: Option<String>,
+    custom_color_dollar: Option<String>,
+    custom_color_modifiers: Option<String>,
+    custom_color_boolean: Option<String>,
+    custom_color_separators: Option<String>,
+    // ── Dual-decoration mode ───────────────────────────────────────────────
+    /// When true, both semantic tokens (theme-driven) AND text decorations
+    /// (custom colors) are active simultaneously.
+    semantic_decorations: Option<bool>,
+}
+
+// ============================================================================
+// Custom color notification types
+// ============================================================================
+
+/// A token that carries a single fixed color (no index into a palette).
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SimpleColorToken {
+    range: lsp_types::Range,
+}
+
+/// A function-name token whose color is chosen by index into the palette.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CustomColorToken {
+    range: lsp_types::Range,
+    color_index: usize,
+}
+
+/// Notification sent from the server to the client with all colored token
+/// ranges so the extension can apply `TextEditorDecorationType`s.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CustomColorNotification {
+    uri: lsp_types::Url,
+    /// Function-name tokens — colored via `custom_colors` palette (rotating/hashed).
+    tokens: Vec<CustomColorToken>,
+    /// Raw text nodes — colored via `custom_color_text`.
+    text_tokens: Vec<SimpleColorToken>,
+    /// Time-literal tokens (e.g. `10m`, `30s`) — colored via `custom_color_time`.
+    time_tokens: Vec<SimpleColorToken>,
+    /// Numeric-literal tokens — colored via `custom_color_numbers`.
+    number_tokens: Vec<SimpleColorToken>,
+    /// `$` prefix tokens — colored via `custom_color_dollar`.
+    dollar_tokens: Vec<SimpleColorToken>,
+    /// Modifier character tokens (`!`, `#`, `?`, etc.) — colored via `custom_color_modifiers`.
+    modifier_tokens: Vec<SimpleColorToken>,
+    /// Boolean-literal tokens (`true`/`false`) — colored via `custom_color_boolean`.
+    boolean_tokens: Vec<SimpleColorToken>,
+    /// `;` separator tokens — colored via `custom_color_separators`.
+    separator_tokens: Vec<SimpleColorToken>,
+}
+
+impl tower_lsp::lsp_types::notification::Notification for CustomColorNotification {
+    type Params = CustomColorNotification;
+    const METHOD: &'static str = "forge/customColors";
 }
 
 // ============================================================================
@@ -102,36 +160,96 @@ impl ForgeLanguageServer {
         };
 
         if let Some(cfg) = self.config.read().await.as_ref() {
-            if let Some(colors) = &cfg.custom_colors {
-                if !colors.is_empty() {
-                    let mut color_tokens = Vec::new();
-                    let constant_colors = cfg.constant_custom_colors.unwrap_or(false);
-                    collect_custom_color_tokens(
-                        &ast,
-                        &text,
-                        &mut color_tokens,
-                        colors.len(),
-                        constant_colors,
-                    );
+            let has_any_custom = cfg
+                .custom_colors
+                .as_ref()
+                .map(|v| !v.is_empty())
+                .unwrap_or(false)
+                || cfg.custom_color_text.is_some()
+                || cfg.custom_color_time.is_some()
+                || cfg.custom_color_numbers.is_some()
+                || cfg.custom_color_dollar.is_some()
+                || cfg.custom_color_modifiers.is_some()
+                || cfg.custom_color_boolean.is_some()
+                || cfg.custom_color_separators.is_some();
 
-                    #[derive(serde::Serialize, serde::Deserialize)]
-                    struct CustomColorNotification {
-                        uri: lsp_types::Url,
-                        tokens: Vec<CustomColorToken>,
-                    }
+            if has_any_custom {
+                let mut color_tokens = Vec::new();
+                let mut text_tokens = Vec::new();
+                let mut time_tokens = Vec::new();
+                let mut number_tokens = Vec::new();
+                let mut dollar_tokens = Vec::new();
+                let mut modifier_tokens = Vec::new();
+                let mut boolean_tokens = Vec::new();
+                let mut separator_tokens = Vec::new();
+                let mut dummy_semantic_tokens = Vec::new();
 
-                    impl tower_lsp::lsp_types::notification::Notification for CustomColorNotification {
-                        type Params = CustomColorNotification;
-                        const METHOD: &'static str = "forge/customColors";
-                    }
+                let color_count = cfg.custom_colors.as_ref().map(|v| v.len()).unwrap_or(0);
+                let constant_colors = cfg.constant_custom_colors.unwrap_or(false);
+                let mut state = 0;
 
-                    self.client
-                        .send_notification::<CustomColorNotification>(CustomColorNotification {
-                            uri: uri.clone(),
-                            tokens: color_tokens,
-                        })
-                        .await;
+                collect_all_decorations_and_semantic_tokens(
+                    &ast,
+                    &text,
+                    &mut color_tokens,
+                    &mut text_tokens,
+                    &mut time_tokens,
+                    &mut number_tokens,
+                    &mut dollar_tokens,
+                    &mut modifier_tokens,
+                    &mut boolean_tokens,
+                    &mut separator_tokens,
+                    &mut dummy_semantic_tokens,
+                    color_count,
+                    &mut state,
+                    constant_colors,
+                    !is_js_ts, // inside_code_block: true for .forge, false for JS/TS top-level
+                );
+
+                if cfg.custom_colors.is_none()
+                    || cfg
+                        .custom_colors
+                        .as_ref()
+                        .map(|v| v.is_empty())
+                        .unwrap_or(true)
+                {
+                    color_tokens.clear();
                 }
+                if cfg.custom_color_text.is_none() {
+                    text_tokens.clear();
+                }
+                if cfg.custom_color_time.is_none() {
+                    time_tokens.clear();
+                }
+                if cfg.custom_color_numbers.is_none() {
+                    number_tokens.clear();
+                }
+                if cfg.custom_color_dollar.is_none() {
+                    dollar_tokens.clear();
+                }
+                if cfg.custom_color_modifiers.is_none() {
+                    modifier_tokens.clear();
+                }
+                if cfg.custom_color_boolean.is_none() {
+                    boolean_tokens.clear();
+                }
+                if cfg.custom_color_separators.is_none() {
+                    separator_tokens.clear();
+                }
+
+                self.client
+                    .send_notification::<CustomColorNotification>(CustomColorNotification {
+                        uri: uri.clone(),
+                        tokens: color_tokens,
+                        text_tokens,
+                        time_tokens,
+                        number_tokens,
+                        dollar_tokens,
+                        modifier_tokens,
+                        boolean_tokens,
+                        separator_tokens,
+                    })
+                    .await;
             }
         }
 
@@ -449,31 +567,46 @@ impl LanguageServer for ForgeLanguageServer {
                     retrigger_characters: Some(vec![";".to_string()]),
                     ..lsp_types::SignatureHelpOptions::default()
                 }),
-                semantic_tokens_provider: if self
-                    .pending_config
-                    .lock()
-                    .await
-                    .as_ref()
-                    .and_then(|c| c.custom_colors.as_ref())
-                    .is_some()
-                {
-                    None
-                } else {
-                    Some(
-                        lsp_types::SemanticTokensServerCapabilities::SemanticTokensOptions(
-                            lsp_types::SemanticTokensOptions {
-                                legend: lsp_types::SemanticTokensLegend {
-                                    token_types: vec![
-                                        lsp_types::SemanticTokenType::FUNCTION,
-                                        lsp_types::SemanticTokenType::COMMENT,
-                                    ],
-                                    token_modifiers: vec![],
+                semantic_tokens_provider: {
+                    // Disable semantic tokens when custom_colors is set, UNLESS
+                    // semantic_decorations:true is configured (dual-mode).
+                    let has_custom_colors;
+                    let semantic_decorations;
+                    {
+                        let pending = self.pending_config.lock().await;
+                        let cfg = pending.as_ref();
+                        has_custom_colors = cfg
+                            .and_then(|c| c.custom_colors.as_ref())
+                            .map(|v| !v.is_empty())
+                            .unwrap_or(false);
+                        semantic_decorations =
+                            cfg.and_then(|c| c.semantic_decorations).unwrap_or(false);
+                    }
+                    if has_custom_colors && !semantic_decorations {
+                        None
+                    } else {
+                        Some(
+                            lsp_types::SemanticTokensServerCapabilities::SemanticTokensOptions(
+                                lsp_types::SemanticTokensOptions {
+                                    legend: lsp_types::SemanticTokensLegend {
+                                        token_types: vec![
+                                            lsp_types::SemanticTokenType::FUNCTION,  // 0
+                                            lsp_types::SemanticTokenType::COMMENT,   // 1
+                                            lsp_types::SemanticTokenType::STRING,    // 2
+                                            lsp_types::SemanticTokenType::NUMBER,    // 3
+                                            lsp_types::SemanticTokenType::MACRO,     // 4 (time)
+                                            lsp_types::SemanticTokenType::OPERATOR, // 5 (modifiers & separators)
+                                            lsp_types::SemanticTokenType::DECORATOR, // 6 (dollar sign)
+                                            lsp_types::SemanticTokenType::KEYWORD,   // 7 (booleans)
+                                        ],
+                                        token_modifiers: vec![],
+                                    },
+                                    full: Some(lsp_types::SemanticTokensFullOptions::Bool(true)),
+                                    ..lsp_types::SemanticTokensOptions::default()
                                 },
-                                full: Some(lsp_types::SemanticTokensFullOptions::Bool(true)),
-                                ..lsp_types::SemanticTokensOptions::default()
-                            },
-                        ),
-                    )
+                            ),
+                        )
+                    }
                 },
                 definition_provider: Some(lsp_types::OneOf::Left(true)),
                 folding_range_provider: Some(lsp_types::FoldingRangeProviderCapability::Simple(
@@ -904,6 +1037,7 @@ impl LanguageServer for ForgeLanguageServer {
         params: lsp_types::SemanticTokensParams,
     ) -> Result<Option<lsp_types::SemanticTokensResult>> {
         let uri = &params.text_document.uri;
+        let is_js_ts = uri.path().ends_with(".js") || uri.path().ends_with(".ts");
 
         let text = {
             let docs = self.documents.read().await;
@@ -935,8 +1069,33 @@ impl LanguageServer for ForgeLanguageServer {
             }
         };
 
+        let mut dummy_colors = Vec::new();
+        let mut dummy_text = Vec::new();
+        let mut dummy_time = Vec::new();
+        let mut dummy_number = Vec::new();
+        let mut dummy_dollar = Vec::new();
+        let mut dummy_modifier = Vec::new();
+        let mut dummy_boolean = Vec::new();
+        let mut dummy_separator = Vec::new();
         let mut tokens = Vec::new();
-        collect_semantic_tokens(ast, &text, &mut tokens);
+
+        collect_all_decorations_and_semantic_tokens(
+            ast,
+            &text,
+            &mut dummy_colors,
+            &mut dummy_text,
+            &mut dummy_time,
+            &mut dummy_number,
+            &mut dummy_dollar,
+            &mut dummy_modifier,
+            &mut dummy_boolean,
+            &mut dummy_separator,
+            &mut tokens,
+            0,
+            &mut 0,
+            false,
+            !is_js_ts,
+        );
 
         tokens.sort_by(|a, b| {
             if a.line != b.line {
@@ -1810,47 +1969,394 @@ struct RawSemanticToken {
     modifier_mask: u32,
 }
 
-const TOKEN_TYPE_FUNCTION: u32 = 0;
-const TOKEN_TYPE_COMMENT: u32 = 1;
+const TOKEN_TYPE_FUNCTION: u32 = 0; // FUNCTION  (index 0)
+const TOKEN_TYPE_COMMENT: u32 = 1; // COMMENT   (index 1)
+const TOKEN_TYPE_STRING: u32 = 2; // STRING    (index 2)
+const TOKEN_TYPE_NUMBER: u32 = 3; // NUMBER    (index 3)
+const TOKEN_TYPE_TIME: u32 = 4; // MACRO     (index 4)
+const TOKEN_TYPE_OPERATOR: u32 = 5; // OPERATOR  (index 5) — modifiers
+const TOKEN_TYPE_DOLLAR: u32 = 6; // DECORATOR (index 6) — dollar sign
+const TOKEN_TYPE_SEPARATOR: u32 = 5; // OPERATOR  (index 5) — reuse for separators
+const TOKEN_TYPE_BOOLEAN: u32 = 7; // KEYWORD   (index 7)
 
-fn collect_semantic_tokens(node: &AstNode, text: &str, tokens: &mut Vec<RawSemanticToken>) {
+fn get_sub_tokens_in_text(content: &str, base_offset: usize) -> (Vec<Span>, Vec<Span>, Vec<Span>) {
+    let mut times = Vec::new();
+    let mut numbers = Vec::new();
+    let mut booleans = Vec::new();
+
+    let bytes = content.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+
+    while i < len {
+        // Check Boolean "true"
+        if i + 4 <= len && &bytes[i..i + 4] == b"true" {
+            let before_ok =
+                i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+            let after_ok =
+                i + 4 >= len || !(bytes[i + 4].is_ascii_alphanumeric() || bytes[i + 4] == b'_');
+            if before_ok && after_ok {
+                booleans.push(Span::new(base_offset + i, base_offset + i + 4));
+                i += 4;
+                continue;
+            }
+        }
+
+        // Check Boolean "false"
+        if i + 5 <= len && &bytes[i..i + 5] == b"false" {
+            let before_ok =
+                i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+            let after_ok =
+                i + 5 >= len || !(bytes[i + 5].is_ascii_alphanumeric() || bytes[i + 5] == b'_');
+            if before_ok && after_ok {
+                booleans.push(Span::new(base_offset + i, base_offset + i + 5));
+                i += 5;
+                continue;
+            }
+        }
+
+        // Check for number/time starting with digit
+        if bytes[i].is_ascii_digit() {
+            let is_word_start =
+                i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+            if is_word_start {
+                let start = i;
+                let mut temp_i = i;
+                while temp_i < len && bytes[temp_i].is_ascii_digit() {
+                    temp_i += 1;
+                }
+
+                // Check time suffix
+                if temp_i < len && matches!(bytes[temp_i], b's' | b'm' | b'h' | b'd') {
+                    let end = temp_i + 1;
+                    let after_ok =
+                        end >= len || !(bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_');
+                    if after_ok {
+                        times.push(Span::new(base_offset + start, base_offset + end));
+                        i = end;
+                        continue;
+                    }
+                }
+
+                // Check decimal
+                let mut decimal_i = temp_i;
+                if decimal_i + 1 < len
+                    && bytes[decimal_i] == b'.'
+                    && bytes[decimal_i + 1].is_ascii_digit()
+                {
+                    decimal_i += 1; // consume `.`
+                    while decimal_i < len && bytes[decimal_i].is_ascii_digit() {
+                        decimal_i += 1;
+                    }
+                }
+
+                let is_word_end = decimal_i >= len
+                    || !(bytes[decimal_i].is_ascii_alphanumeric() || bytes[decimal_i] == b'_');
+                if is_word_end {
+                    numbers.push(Span::new(base_offset + start, base_offset + decimal_i));
+                    i = decimal_i;
+                    continue;
+                }
+            }
+        }
+
+        i += 1;
+    }
+
+    (times, numbers, booleans)
+}
+
+fn get_string_spans(total_span: Span, mut exclude_spans: Vec<Span>) -> Vec<Span> {
+    exclude_spans.sort_by_key(|s| s.start);
+
+    let mut string_spans = Vec::new();
+    let mut current_start = total_span.start;
+
+    for excl in exclude_spans {
+        if excl.start > current_start {
+            string_spans.push(Span::new(current_start, excl.start));
+        }
+        current_start = current_start.max(excl.end);
+    }
+
+    if total_span.end > current_start {
+        string_spans.push(Span::new(current_start, total_span.end));
+    }
+
+    string_spans
+}
+
+fn collect_all_decorations_and_semantic_tokens(
+    node: &AstNode,
+    text: &str,
+    tokens: &mut Vec<CustomColorToken>,
+    text_tokens: &mut Vec<SimpleColorToken>,
+    time_tokens: &mut Vec<SimpleColorToken>,
+    number_tokens: &mut Vec<SimpleColorToken>,
+    dollar_tokens: &mut Vec<SimpleColorToken>,
+    modifier_tokens: &mut Vec<SimpleColorToken>,
+    boolean_tokens: &mut Vec<SimpleColorToken>,
+    separator_tokens: &mut Vec<SimpleColorToken>,
+    semantic_tokens: &mut Vec<RawSemanticToken>,
+    color_count: usize,
+    state: &mut usize,
+    constant_colors: bool,
+    inside_code_block: bool,
+) {
     match node {
         AstNode::Program { body, .. } => {
             for child in body {
-                collect_semantic_tokens(child, text, tokens);
+                collect_all_decorations_and_semantic_tokens(
+                    child,
+                    text,
+                    tokens,
+                    text_tokens,
+                    time_tokens,
+                    number_tokens,
+                    dollar_tokens,
+                    modifier_tokens,
+                    boolean_tokens,
+                    separator_tokens,
+                    semantic_tokens,
+                    color_count,
+                    state,
+                    constant_colors,
+                    inside_code_block,
+                );
             }
         }
         AstNode::FunctionCall {
             name,
             name_span,
+            modifier_span,
             args,
             ..
         } => {
-            if !name.eq_ignore_ascii_case("c") && !name.eq_ignore_ascii_case("$c") {
-                let pos = byte_offset_to_position(text, name_span.start);
-                let length = (name_span.end - name_span.start) as u32;
+            let is_comment = name.eq_ignore_ascii_case("c") || name.eq_ignore_ascii_case("$c");
 
-                tokens.push(RawSemanticToken {
+            if is_comment {
+                let pos = byte_offset_to_position(text, name_span.start);
+                semantic_tokens.push(RawSemanticToken {
                     line: pos.line,
                     start: pos.character,
-                    length,
-                    token_type: TOKEN_TYPE_FUNCTION,
+                    length: (name_span.end - name_span.start) as u32,
+                    token_type: TOKEN_TYPE_COMMENT,
+                    modifier_mask: 0,
+                });
+                if let Some(args) = args {
+                    for arg in args {
+                        for part in &arg.parts {
+                            collect_all_decorations_and_semantic_tokens(
+                                part,
+                                text,
+                                tokens,
+                                text_tokens,
+                                time_tokens,
+                                number_tokens,
+                                dollar_tokens,
+                                modifier_tokens,
+                                boolean_tokens,
+                                separator_tokens,
+                                semantic_tokens,
+                                color_count,
+                                state,
+                                constant_colors,
+                                inside_code_block,
+                            );
+                        }
+                    }
+                }
+            } else {
+                // 1. Dollar sign ($)
+                let dollar_span = Span::new(name_span.start, name_span.start + 1);
+                let dollar_range = span_to_range(text, dollar_span);
+                dollar_tokens.push(SimpleColorToken {
+                    range: dollar_range,
+                });
+
+                let pos_dollar = byte_offset_to_position(text, dollar_span.start);
+                semantic_tokens.push(RawSemanticToken {
+                    line: pos_dollar.line,
+                    start: pos_dollar.character,
+                    length: 1,
+                    token_type: TOKEN_TYPE_DOLLAR,
+                    modifier_mask: 0,
+                });
+
+                // 2. Modifiers
+                let mut modifier_end = name_span.start + 1;
+                if let Some(mspan) = modifier_span {
+                    if !mspan.is_empty() {
+                        modifier_tokens.push(SimpleColorToken {
+                            range: span_to_range(text, *mspan),
+                        });
+                        modifier_end = mspan.end;
+
+                        let pos_mod = byte_offset_to_position(text, mspan.start);
+                        semantic_tokens.push(RawSemanticToken {
+                            line: pos_mod.line,
+                            start: pos_mod.character,
+                            length: (mspan.end - mspan.start) as u32,
+                            token_type: TOKEN_TYPE_OPERATOR,
+                            modifier_mask: 0,
+                        });
+                    }
+                }
+
+                // 3. Function identifier name (excluding dollar and modifiers)
+                let id_span = Span::new(modifier_end, name_span.end);
+                if !id_span.is_empty() {
+                    let range = span_to_range(text, id_span);
+                    if color_count > 0 {
+                        let color_index = if constant_colors {
+                            use std::collections::hash_map::DefaultHasher;
+                            use std::hash::{Hash, Hasher};
+                            let mut hasher = DefaultHasher::new();
+                            name.hash(&mut hasher);
+                            (hasher.finish() as usize) % color_count
+                        } else {
+                            let idx = *state % color_count;
+                            *state += 1;
+                            idx
+                        };
+                        tokens.push(CustomColorToken { range, color_index });
+                    }
+
+                    let pos_id = byte_offset_to_position(text, id_span.start);
+                    semantic_tokens.push(RawSemanticToken {
+                        line: pos_id.line,
+                        start: pos_id.character,
+                        length: (id_span.end - id_span.start) as u32,
+                        token_type: TOKEN_TYPE_FUNCTION,
+                        modifier_mask: 0,
+                    });
+                }
+
+                // 4. Arguments and separators
+                if let Some(arguments) = args {
+                    if arguments.len() > 1 {
+                        for k in 0..arguments.len() - 1 {
+                            let sep_start = arguments[k].span.end;
+                            let sep_span = Span::new(sep_start, sep_start + 1);
+                            let range = span_to_range(text, sep_span);
+                            separator_tokens.push(SimpleColorToken { range });
+
+                            let pos_sep = byte_offset_to_position(text, sep_span.start);
+                            semantic_tokens.push(RawSemanticToken {
+                                line: pos_sep.line,
+                                start: pos_sep.character,
+                                length: 1,
+                                token_type: TOKEN_TYPE_SEPARATOR,
+                                modifier_mask: 0,
+                            });
+                        }
+                    }
+
+                    for arg in arguments {
+                        for part in &arg.parts {
+                            collect_all_decorations_and_semantic_tokens(
+                                part,
+                                text,
+                                tokens,
+                                text_tokens,
+                                time_tokens,
+                                number_tokens,
+                                dollar_tokens,
+                                modifier_tokens,
+                                boolean_tokens,
+                                separator_tokens,
+                                semantic_tokens,
+                                color_count,
+                                state,
+                                constant_colors,
+                                true, // inside function args → always inside a code block
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        AstNode::Text { content, span } => {
+            // Only emit text/number/time/boolean tokens when inside a code block.
+            // For JS/TS files, top-level Text nodes are raw JS/TS source — not Forge content.
+            if !inside_code_block {
+                return;
+            }
+
+            let (times, numbers, booleans) = get_sub_tokens_in_text(content, span.start);
+
+            for t_span in &times {
+                time_tokens.push(SimpleColorToken {
+                    range: span_to_range(text, *t_span),
+                });
+                let pos = byte_offset_to_position(text, t_span.start);
+                semantic_tokens.push(RawSemanticToken {
+                    line: pos.line,
+                    start: pos.character,
+                    length: (t_span.end - t_span.start) as u32,
+                    token_type: TOKEN_TYPE_TIME,
                     modifier_mask: 0,
                 });
             }
 
-            if let Some(args) = args {
-                for arg in args {
-                    for part in &arg.parts {
-                        collect_semantic_tokens(part, text, tokens);
-                    }
+            for n_span in &numbers {
+                number_tokens.push(SimpleColorToken {
+                    range: span_to_range(text, *n_span),
+                });
+                let pos = byte_offset_to_position(text, n_span.start);
+                semantic_tokens.push(RawSemanticToken {
+                    line: pos.line,
+                    start: pos.character,
+                    length: (n_span.end - n_span.start) as u32,
+                    token_type: TOKEN_TYPE_NUMBER,
+                    modifier_mask: 0,
+                });
+            }
+
+            for b_span in &booleans {
+                boolean_tokens.push(SimpleColorToken {
+                    range: span_to_range(text, *b_span),
+                });
+                let pos = byte_offset_to_position(text, b_span.start);
+                semantic_tokens.push(RawSemanticToken {
+                    line: pos.line,
+                    start: pos.character,
+                    length: (b_span.end - b_span.start) as u32,
+                    token_type: TOKEN_TYPE_BOOLEAN,
+                    modifier_mask: 0,
+                });
+            }
+
+            let mut exclude_spans = Vec::new();
+            exclude_spans.extend(times);
+            exclude_spans.extend(numbers);
+            exclude_spans.extend(booleans);
+
+            let string_spans = get_string_spans(*span, exclude_spans);
+            for s_span in string_spans {
+                if s_span.is_empty() {
+                    continue;
+                }
+                let substring = &text[s_span.start..s_span.end];
+                if !substring.trim().is_empty() {
+                    text_tokens.push(SimpleColorToken {
+                        range: span_to_range(text, s_span),
+                    });
+                    let pos = byte_offset_to_position(text, s_span.start);
+                    semantic_tokens.push(RawSemanticToken {
+                        line: pos.line,
+                        start: pos.character,
+                        length: (s_span.end - s_span.start) as u32,
+                        token_type: TOKEN_TYPE_STRING,
+                        modifier_mask: 0,
+                    });
                 }
             }
         }
         AstNode::Escaped { name, span, .. } => {
             if name.eq_ignore_ascii_case("c") || name.eq_ignore_ascii_case("$c") {
                 let pos = byte_offset_to_position(text, span.start);
-                tokens.push(RawSemanticToken {
+                semantic_tokens.push(RawSemanticToken {
                     line: pos.line,
                     start: pos.character,
                     length: (span.end - span.start) as u32,
@@ -1859,86 +2365,6 @@ fn collect_semantic_tokens(node: &AstNode, text: &str, tokens: &mut Vec<RawSeman
                 });
             }
         }
-        _ => {}
-    }
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-struct CustomColorToken {
-    range: lsp_types::Range,
-    color_index: usize,
-}
-
-fn collect_custom_color_tokens(
-    node: &AstNode,
-    text: &str,
-    tokens: &mut Vec<CustomColorToken>,
-    color_count: usize,
-    constant_colors: bool,
-) {
-    let mut state = 0;
-    collect_custom_color_tokens_inner(node, text, tokens, color_count, &mut state, constant_colors);
-}
-
-fn collect_custom_color_tokens_inner(
-    node: &AstNode,
-    text: &str,
-    tokens: &mut Vec<CustomColorToken>,
-    color_count: usize,
-    state: &mut usize,
-    constant_colors: bool,
-) {
-    match node {
-        AstNode::Program { body, .. } => {
-            for child in body {
-                collect_custom_color_tokens_inner(
-                    child,
-                    text,
-                    tokens,
-                    color_count,
-                    state,
-                    constant_colors,
-                );
-            }
-        }
-        AstNode::FunctionCall {
-            name,
-            name_span,
-            args,
-            ..
-        } => {
-            if !name.eq_ignore_ascii_case("c") && !name.eq_ignore_ascii_case("$c") {
-                let range = span_to_range(text, *name_span);
-                let color_index = if constant_colors {
-                    use std::collections::hash_map::DefaultHasher;
-                    use std::hash::{Hash, Hasher};
-                    let mut hasher = DefaultHasher::new();
-                    name.hash(&mut hasher);
-                    (hasher.finish() as usize) % color_count
-                } else {
-                    let idx = *state % color_count;
-                    *state += 1;
-                    idx
-                };
-                tokens.push(CustomColorToken { range, color_index });
-            }
-
-            if let Some(args) = args {
-                for arg in args {
-                    for part in &arg.parts {
-                        collect_custom_color_tokens_inner(
-                            part,
-                            text,
-                            tokens,
-                            color_count,
-                            state,
-                            constant_colors,
-                        );
-                    }
-                }
-            }
-        }
-        AstNode::Escaped { .. } => {}
         _ => {}
     }
 }
